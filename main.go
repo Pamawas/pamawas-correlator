@@ -4,14 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -565,11 +562,6 @@ func (c *Correlator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Simple metrics - in production you'd use prometheus client library
-	var uptime string
-	if !c.lastRun.IsZero() {
-		uptime = fmt.Sprintf("%.2f", time.Since(c.lastRun).Seconds())
-	}
-
 	fmt.Fprintf(w, `# HELP pamawas_correlator_last_run_timestamp_seconds Timestamp of last correlation run
 # TYPE pamawas_correlator_last_run_timestamp_seconds gauge
 pamawas_correlator_last_run_timestamp_seconds %d
