@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +52,20 @@ type Correlator struct {
 	mu          sync.Mutex
 	lastRun     time.Time
 	running     bool
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancelFunc  context.CancelFunc
+}
+
+// HealthStatus represents the health of the correlator
+type HealthStatus struct {
+	Status      string    `json:"status"`
+	Timestamp   time.Time `json:"timestamp"`
+	LastRun     time.Time `json:"last_run"`
+	Running     bool      `json:"running"`
+	TimeWindow  string    `json:"time_window"`
+	Uptime      string    `json:"uptime,omitempty"`
+	Version     string    `json:"version,omitempty"`
 }
 
 func main() {
@@ -76,42 +95,81 @@ func main() {
 		log.Fatalf("Error connecting to database: %v", err)
 	}
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	c := &Correlator{
 		db:       db,
 		timeWindow: timeWindow,
+		ctx:      ctx,
 	}
 
 	// HTTP server for health checks and manual triggers
 	r := http.NewServeMux()
-	r.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
-	r.HandleFunc("/trigger", func(w http.ResponseWriter, r *http.Request) {
-		if err := c.Correlate(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte("correlation triggered"))
-	})
-	r.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		status := map[string]interface{}{
-			"last_run": c.lastRun,
-			"running":  c.running,
-			"time_window": c.timeWindow.String(),
-		}
-		json.NewEncoder(w).Encode(status)
-	})
+	r.HandleFunc("/healthz", c.healthHandler)
+	r.HandleFunc("/ready", c.readyHandler)
+	r.HandleFunc("/trigger", c.triggerHandler)
+	r.HandleFunc("/status", c.statusHandler)
+	r.HandleFunc("/metrics", c.metricsHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	log.Printf("Starting correlator on :%s with time window %s", port, timeWindow)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+
+	// Start background correlation worker if enabled
+	if os.Getenv("CORRELATOR_MODE") != "manual" {
+		go c.correlationWorker()
+	}
+
+	// Start HTTP server
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	// Listen for shutdown signals
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Server forced to shutdown: %v", err)
+		}
+	}()
+
+	log.Fatal(srv.ListenAndServe())
+}
+
+// correlationWorker runs the correlation process periodically
+func (c *Correlator) correlationWorker() {
+	intervalStr := os.Getenv("CORRELATION_INTERVAL")
+	if intervalStr == "" {
+		intervalStr = "1m" // default 1 minute
+	}
+	interval, err := time.ParseDuration(intervalStr)
+	if err != nil {
+		log.Fatalf("Invalid CORRELATION_INTERVAL: %v", err)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			log.Println("Correlation worker stopped")
+			return
+		case <-ticker.C:
+			if err := c.Correlate(); err != nil {
+				log.Printf("Correlation error: %v", err)
+				// Continue despite errors - don't want to stop the worker
+			}
+		}
+	}
 }
 
 // Correlate performs one correlation cycle
@@ -129,6 +187,9 @@ func (c *Correlator) Correlate() error {
 		c.running = false
 		c.mu.Unlock()
 	}()
+
+	c.wg.Add(1)
+	defer c.wg.Done()
 
 	startTime := time.Now()
 	log.Printf("Starting correlation cycle")
@@ -345,11 +406,25 @@ func (c *Correlator) createIncidentFromGroup(group []Event) Incident {
 		ResolvedAt:   maxTime, // if still firing, this will be updated later
 		Severity:     severity,
 		AffectedServices: services,
+		EventIDs:     c.extractEventIDs(group),
 	}
+}
+
+// extractEventIDs extracts IDs from a group of events
+func (c *Correlator) extractEventIDs(group []Event) []string {
+	ids := make([]string, len(group))
+	for i, event := range group {
+		ids[i] = event.ID
+	}
+	return ids
 }
 
 // saveIncidents inserts incidents into the database
 func (c *Correlator) saveIncidents(incidents []Incident) error {
+	if len(incidents) == 0 {
+		return nil
+	}
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
@@ -381,9 +456,142 @@ func (c *Correlator) saveIncidents(incidents []Incident) error {
 }
 
 // markEventsCorrelated marks events as correlated by ensuring they appear in incident_events
-// Note: This is actually done in saveIncidents, but we keep this for clarity
 func (c *Correlator) markEventsCorrelated(events []Event) error {
-	// Events are marked as correlated when we insert into incident_events in saveIncidents
-	// This function is kept for potential future use if we need a separate marking step
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Build a placeholder query - in practice, we'd use the IDs from the incidents we just created
+	// For now, we'll rely on the fact that saveIncients already created the incident_events links
+	// This is a simplified approach - in reality we'd need to track which events belong to which incidents
+	// But since saveIncidents already does the linking, we can skip this step
 	return nil
+}
+
+// Health check handlers
+func (c *Correlator) healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check database connectivity
+	if err := c.db.PingContext(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "unhealthy",
+			"error":  fmt.Sprintf("Database connection failed: %v", err),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(HealthStatus{
+		Status:      "healthy",
+		Timestamp:   time.Now().UTC(),
+		LastRun:     c.lastRun,
+		Running:     c.running,
+		TimeWindow:  c.timeWindow.String(),
+		Version:     "1.0.0",
+	})
+}
+
+func (c *Correlator) readyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Simple readiness check - if we can connect to db, we're ready
+	if err := c.db.PingContext(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "not ready",
+			"error":  fmt.Sprintf("Database not ready: %v", err),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func (c *Correlator) triggerHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := c.Correlate(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "correlation triggered successfully",
+	})
+}
+
+func (c *Correlator) statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"last_run": c.lastRun,
+		"running":  c.running,
+		"time_window": c.timeWindow.String(),
+		"version": "1.0.0",
+	})
+}
+
+func (c *Correlator) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Simple metrics - in production you'd use prometheus client library
+	var uptime string
+	if !c.lastRun.IsZero() {
+		uptime = fmt.Sprintf("%.2f", time.Since(c.lastRun).Seconds())
+	}
+
+	fmt.Fprintf(w, `# HELP pamawas_correlator_last_run_timestamp_seconds Timestamp of last correlation run
+# TYPE pamawas_correlator_last_run_timestamp_seconds gauge
+pamawas_correlator_last_run_timestamp_seconds %d
+`,
+		c.lastRun.Unix())
+
+	fmt.Fprintf(w, `# HELP pamawas_correlator_running Whether the correlator is currently running
+# TYPE pamawas_correlator_running gauge
+pamawas_correlator_running %d
+`,
+		boolToInt(c.running))
+
+	fmt.Fprintf(w, `# HELP pamawas_correlator_time_window_seconds Correlation time window in seconds
+# TYPE pamawas_correlator_time_window_seconds gauge
+pamawas_correlator_time_window_seconds %.2f
+`,
+		c.timeWindow.Seconds())
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
