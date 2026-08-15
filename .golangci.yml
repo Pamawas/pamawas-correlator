@@ -4,8 +4,6 @@
 version: "2"
 
 linters:
-  # Enable only safe linters by default
-  disable-all: true
   enable:
     - errcheck
     - gosec
@@ -17,21 +15,6 @@ linters:
     - unparam
     - noctx
     - rowserrcheck
-  exclusions:
-    presets:
-      - std-error-handling
-    rules:
-      - path: handlers/handlers\.go
-        linters:
-          - errcheck
-      - path: service/correlator\.go
-        linters:
-          - errcheck
-          - noctx
-          - unparam
-      - path: main\.go
-        linters:
-          - errcheck
 
 linters-settings:
   gosec:
@@ -59,7 +42,4 @@ issues:
 
 run:
   timeout: 5m
-  skip-dirs:
-    - vendor
-    - .git
   modules-download-mode: readonly
