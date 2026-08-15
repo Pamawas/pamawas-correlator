@@ -35,9 +35,9 @@ jobs:
         fail_ci_if_error: false
 
     - name: Run linter
-      uses: golangci-lint/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v9
       with:
-        version: v2.1
+        version: v2.12
 
   build:
     name: Build & Test Build
