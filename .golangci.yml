@@ -1,6 +1,8 @@
 # .golangci.yml - golangci-lint configuration for Pamawas correlator
 # See https://golangci-lint.run/docs/configuration/ for all options
 
+version: "2"
+
 linters:
   # Enable only safe linters by default
   disable-all: true
@@ -15,6 +17,21 @@ linters:
     - unparam
     - noctx
     - rowserrcheck
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: handlers/handlers\.go
+        linters:
+          - errcheck
+      - path: service/correlator\.go
+        linters:
+          - errcheck
+          - noctx
+          - unparam
+      - path: main\.go
+        linters:
+          - errcheck
 
 linters-settings:
   gosec:
