@@ -48,10 +48,12 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		h.metrics.DBConnectionErrors.Inc()
 		log.Error().Err(err).Msg("Health check failed: database connection")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(models.HealthResponse{
+		if encodeErr := json.NewEncoder(w).Encode(models.HealthResponse{
 			Status: "unhealthy",
 			Error:  fmt.Sprintf("Database connection failed: %v", err),
-		})
+		}); encodeErr != nil {
+			log.Error().Err(encodeErr).Msg("Failed to encode health response")
+		}
 		return
 	}
 
@@ -61,14 +63,16 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	h.correlator.MuUnlock()
 
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(models.HealthResponse{
+	if err := json.NewEncoder(w).Encode(models.HealthResponse{
 		Status:      "healthy",
 		Timestamp:   time.Now().UTC(),
 		LastRun:     lastRun,
 		Running:     running,
 		TimeWindow:  h.cfg.TimeWindow.String(),
 		Version:     "1.0.0",
-	})
+	}); err != nil {
+		log.Error().Err(err).Msg("Failed to encode health response")
+	}
 }
 
 // ReadyHandler handles readiness check requests
@@ -82,15 +86,19 @@ func (h *Handler) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.PingContext(r.Context()); err != nil {
 		log.Error().Err(err).Msg("Readiness check failed: database not ready")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(models.HealthResponse{
+		if encodeErr := json.NewEncoder(w).Encode(models.HealthResponse{
 			Status: "not ready",
 			Error:  fmt.Sprintf("Database not ready: %v", err),
-		})
+		}); encodeErr != nil {
+			log.Error().Err(encodeErr).Msg("Failed to encode health response")
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(models.HealthResponse{Status: "ready"})
+	if err := json.NewEncoder(w).Encode(models.HealthResponse{Status: "ready"}); err != nil {
+		log.Error().Err(err).Msg("Failed to encode health response")
+	}
 }
 
 // TriggerHandler handles manual correlation trigger
@@ -107,9 +115,11 @@ func (h *Handler) TriggerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(models.TriggerResponse{
+	if err := json.NewEncoder(w).Encode(models.TriggerResponse{
 		Message: "Correlation triggered successfully",
-	})
+	}); err != nil {
+		log.Error().Err(err).Msg("Failed to encode trigger response")
+	}
 }
 
 // StatusHandler returns the current status of the correlator
@@ -123,7 +133,7 @@ func (h *Handler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	h.correlator.MuLock()
 	defer h.correlator.MuUnlock()
 
-	_ = json.NewEncoder(w).Encode(models.StatusResponse{
+	if err := json.NewEncoder(w).Encode(models.StatusResponse{
 		LastRun:    h.correlator.LastRun(),
 		Running:    h.correlator.Running(),
 		Uptime:     time.Since(h.correlator.StartTime()).String(),
@@ -131,7 +141,9 @@ func (h *Handler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 		TimeWindow: h.cfg.TimeWindow.String(),
 		Interval:   h.cfg.Interval.String(),
 		Mode:       h.cfg.Mode,
-	})
+	}); err != nil {
+		log.Error().Err(err).Msg("Failed to encode status response")
+	}
 }
 
 // MetricsHandler returns the Prometheus metrics handler

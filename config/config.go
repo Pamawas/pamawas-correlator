@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"time"
 )
@@ -17,10 +18,16 @@ type Config struct {
 
 func Load() Config {
 	timeWindowStr := getEnv("CORRELATION_TIME_WINDOW", "10m")
-	timeWindow, _ := time.ParseDuration(timeWindowStr)
+	timeWindow, err := time.ParseDuration(timeWindowStr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid CORRELATION_TIME_WINDOW: %v", err))
+	}
 
 	intervalStr := getEnv("CORRELATION_INTERVAL", "1m")
-	interval, _ := time.ParseDuration(intervalStr)
+	interval, err := time.ParseDuration(intervalStr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid CORRELATION_INTERVAL: %v", err))
+	}
 
 	cfg := Config{
 		DatabaseURL: getEnv("DATABASE_URL", ""),

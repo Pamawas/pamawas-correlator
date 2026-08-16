@@ -122,10 +122,7 @@ func (c *Correlator) Correlate() error {
 	}
 
 	// Mark events as correlated
-	if err := c.markEventsCorrelated(events); err != nil {
-		c.metrics.CorrelationCyclesTotal.WithLabelValues("error").Inc()
-		return err
-	}
+	c.markEventsCorrelated(events)
 
 	c.mu.Lock()
 	c.lastRun = time.Now()
@@ -150,11 +147,15 @@ func (c *Correlator) getUncorrelatedEvents() ([]models.Event, error) {
 		ORDER BY e.timestamp ASC
 	`
 
-	rows, err := c.db.Query(query)
+	rows, err := c.db.QueryContext(c.ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close rows")
+		}
+	}()
 
 	var events []models.Event
 	for rows.Next() {
@@ -336,14 +337,18 @@ func (c *Correlator) saveIncidents(incidents []models.Incident) error {
 		return nil
 	}
 
-	tx, err := c.db.Begin()
+	tx, err := c.db.BeginTx(c.ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+		}
+	}()
 
 	for _, incident := range incidents {
-		_, err := tx.Exec(
+		_, err := tx.ExecContext(c.ctx,
 			"INSERT INTO incidents (id, title, status, started_at, resolved_at, severity, affected_services) VALUES ($1,$2,$3,$4,$5,$6,$7)",
 			incident.ID, incident.Title, incident.Status, incident.StartedAt, incident.ResolvedAt, incident.Severity, incident.AffectedServices,
 		)
@@ -353,7 +358,7 @@ func (c *Correlator) saveIncidents(incidents []models.Incident) error {
 
 		// Link events to incident
 		for _, eventID := range incident.EventIDs {
-			_, err := tx.Exec(
+			_, err := tx.ExecContext(c.ctx,
 				"INSERT INTO incident_events (incident_id, event_id) VALUES ($1,$2)",
 				incident.ID, eventID,
 			)
@@ -367,15 +372,14 @@ func (c *Correlator) saveIncidents(incidents []models.Incident) error {
 }
 
 // markEventsCorrelated marks events as correlated by ensuring they appear in incident_events
-func (c *Correlator) markEventsCorrelated(events []models.Event) error {
+func (c *Correlator) markEventsCorrelated(events []models.Event) {
 	if len(events) == 0 {
-		return nil
+		return
 	}
 
 	// The saveIncidents function already creates the incident_events links
 	// This is a simplified approach - in reality we'd need to track which events belong to which incidents
 	// But since saveIncidents already does the linking, we can skip this step
-	return nil
 }
 
 // StartWorker starts the background correlation worker
