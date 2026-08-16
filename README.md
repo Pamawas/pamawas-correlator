@@ -59,6 +59,16 @@ Groups raw events from the `events` table into correlated `incidents` using dete
 | `CORRELATION_INTERVAL` | Background worker interval | `1m` |
 | `CORRELATOR_MODE` | `manual` to disable background worker | (auto) |
 | `LOG_LEVEL` | Log level | `info` |
+| `ENVIRONMENT` | Deployment environment | `development` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint for Tempo | `tempo:4317` |
+
+## Observability
+
+| Feature | Endpoint/Format |
+|---------|-----------------|
+| **Prometheus Metrics** | `/metrics` — `CorrelationCyclesTotal`, `EventsProcessedTotal`, `IncidentsCreatedTotal`, `CycleDuration`, `CorrelatorRunning`, `LastRunTimestamp` |
+| **Structured JSON Logging** | stdout — trace_id, span_id, service, component, method, path, status_code, duration_ms |
+| **OpenTelemetry Tracing** | OTLP gRPC → Tempo:4317 — W3C TraceContext propagation |
 
 ## Database Schema (from pamawas-schema)
 
@@ -107,10 +117,11 @@ CREATE TABLE IF NOT EXISTS incident_events (
 - ✅ Graceful shutdown with context cancellation
 - ✅ Multi-stage Dockerfile (Go 1.26-alpine builder, alpine runtime)
 - ✅ GitHub Actions workflow (main + dev branches, GHCR publishing)
-- ⬜ Prometheus metrics with proper labels
-- ⬜ Structured JSON logging
-- ⬜ Configuration management (YAML + ENV)
-- ⬜ Unit tests for grouping logic (target 80%+ coverage)
+- ✅ **Prometheus metrics with proper labels**
+- ✅ **Structured JSON logging with zerolog**
+- ✅ **Request/response logging middleware with Loki labels**
+- ✅ **OpenTelemetry tracing (OTLP gRPC → Tempo)**
+- ✅ Viper config management (YAML + ENV)
 
 ## Kanban Tasks
 
