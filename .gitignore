@@ -1,0 +1,22 @@
+# Build artifacts
+main
+pamawas-*
+test_main
+coverage.out
+*.test
+
+# Dependencies
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

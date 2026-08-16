@@ -1,0 +1,10 @@
+# pamawas-correlator configuration
+# Copy this to config.yaml and adjust values, or use environment variables with PAMAWAS_CORRELATOR_ prefix
+
+database_url: "postgres://pamawas:pamawas@localhost:5432/pamawas?sslmode=disable"
+port: "8080"
+log_level: "info"
+environment: "development"
+time_window: "10m"
+interval: "1m"
+mode: "auto"

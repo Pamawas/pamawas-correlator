@@ -2,8 +2,9 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"time"
+
+	"github.com/spf13/viper"
 )
 
 type Config struct {
@@ -17,37 +18,66 @@ type Config struct {
 }
 
 func Load() Config {
-	timeWindowStr := getEnv("CORRELATION_TIME_WINDOW", "10m")
-	timeWindow, err := time.ParseDuration(timeWindowStr)
-	if err != nil {
-		panic(fmt.Sprintf("invalid CORRELATION_TIME_WINDOW: %v", err))
+	v := viper.New()
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("./config")
+	v.AddConfigPath("/etc/pamawas/")
+	v.SetEnvPrefix("PAMAWAS_CORRELATOR")
+	v.AutomaticEnv()
+
+	// Defaults
+	v.SetDefault("port", "8080")
+	v.SetDefault("log_level", "info")
+	v.SetDefault("environment", "development")
+	v.SetDefault("time_window", "10m")
+	v.SetDefault("interval", "1m")
+	v.SetDefault("mode", "auto")
+
+	if err := v.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			panic(fmt.Sprintf("failed to read config: %v", err))
+		}
 	}
 
-	intervalStr := getEnv("CORRELATION_INTERVAL", "1m")
-	interval, err := time.ParseDuration(intervalStr)
+	timeWindow, err := time.ParseDuration(v.GetString("time_window"))
 	if err != nil {
-		panic(fmt.Sprintf("invalid CORRELATION_INTERVAL: %v", err))
+		panic(fmt.Sprintf("invalid time_window: %v", err))
+	}
+	interval, err := time.ParseDuration(v.GetString("interval"))
+	if err != nil {
+		panic(fmt.Sprintf("invalid interval: %v", err))
 	}
 
 	cfg := Config{
-		DatabaseURL: getEnv("DATABASE_URL", ""),
-		Port:        getEnv("PORT", "8080"),
-		LogLevel:    getEnv("LOG_LEVEL", "info"),
-		Environment: getEnv("ENVIRONMENT", "development"),
+		DatabaseURL: v.GetString("database_url"),
+		Port:        v.GetString("port"),
+		LogLevel:    v.GetString("log_level"),
+		Environment: v.GetString("environment"),
 		TimeWindow:  timeWindow,
 		Interval:    interval,
-		Mode:        getEnv("CORRELATOR_MODE", "auto"),
+		Mode:        v.GetString("mode"),
 	}
 
 	if cfg.DatabaseURL == "" {
-		panic("DATABASE_URL environment variable not set")
+		panic("DATABASE_URL not set (config file or PAMAWAS_CORRELATOR_DATABASE_URL env var)")
 	}
 	return cfg
 }
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func (c Config) Validate() error {
+	if c.DatabaseURL == "" {
+		return fmt.Errorf("database_url is required")
 	}
-	return fallback
+	if c.Port == "" {
+		return fmt.Errorf("port is required")
+	}
+	if c.TimeWindow <= 0 {
+		return fmt.Errorf("time_window must be positive")
+	}
+	if c.Interval <= 0 {
+		return fmt.Errorf("interval must be positive")
+	}
+	return nil
 }
