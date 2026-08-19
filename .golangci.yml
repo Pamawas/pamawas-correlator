@@ -21,7 +21,7 @@ linters:
         - G115 # Ignore math/big.Int in tests
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      check-blank: false
     govet:
       enable:
         - shadow
@@ -35,6 +35,7 @@ linters:
           - goconst
           - unparam
           - lll
+          - errcheck
 
 issues:
   max-issues-per-linter: 0

@@ -37,8 +37,8 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize OpenTelemetry")
 	}
 	defer func() {
-		if err := otelShutdown(context.Background()); err != nil {
-			log.Error().Err(err).Msg("Error shutting down OpenTelemetry")
+		if shutdownErr := otelShutdown(context.Background()); shutdownErr != nil {
+			log.Error().Err(shutdownErr).Msg("Error shutting down OpenTelemetry")
 		}
 	}()
 

@@ -2,395 +2,313 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
-	"sort"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/rs/zerolog/log"
 
 	"github.com/Pamawas/pamawas-correlator/metrics"
 	"github.com/Pamawas/pamawas-correlator/models"
 )
 
-// Correlator holds the database connection and correlation logic
-type Correlator struct {
-	db         *sql.DB
-	timeWindow time.Duration
-	interval   time.Duration
-	mode       string
-	mu         sync.Mutex
-	lastRun    time.Time
-	running    bool
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancelFunc context.CancelFunc
-	startTime  time.Time
-	metrics    *metrics.Metrics
+const (
+	correlationPolicy  = "pamawas-correlation-v1"
+	correlationVersion = 1
+)
+
+type incidentCandidate struct {
+	ID            string
+	Status        string
+	LastEventAt   time.Time
+	StartedAt     time.Time
+	CreatedAt     time.Time
+	Environment   string
+	Service       string
+	Source        string
+	SourceEventID string
+	Severity      string
+	Labels        map[string]string
 }
 
-// NewCorrelator creates a new correlator instance
+var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
+
+func selectCandidate(event models.Event, candidates []incidentCandidate) (incidentCandidate, int, bool) {
+	var selected incidentCandidate
+	selectedScore := -1
+	found := false
+	for _, candidate := range candidates {
+		if candidate.Environment != event.Environment || (candidate.Status != "" && candidate.Status != "open" && candidate.Status != "investigating") {
+			continue
+		}
+		if event.Timestamp.After(candidate.LastEventAt.Add(15*time.Minute)) || event.Timestamp.Before(candidate.LastEventAt.Add(-5*time.Minute)) || event.Timestamp.After(candidate.StartedAt.Add(6*time.Hour)) {
+			continue
+		}
+		score := candidateScore(event, candidate)
+		if score < 50 {
+			continue
+		}
+		if !found || score > selectedScore || score == selectedScore && candidateBefore(candidate, selected) {
+			selected, selectedScore, found = candidate, score, true
+		}
+	}
+	return selected, selectedScore, found
+}
+
+func candidateScore(event models.Event, candidate incidentCandidate) int {
+	score := 0
+	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
+		score += 100
+	}
+	if event.Service != "" && event.Service == candidate.Service {
+		score += 50
+	}
+	for label, weight := range identityLabelScores {
+		if event.Labels[label] != "" && event.Labels[label] == candidate.Labels[label] {
+			score += weight
+		}
+	}
+	return score
+}
+
+func candidateBefore(a, b incidentCandidate) bool {
+	if !a.LastEventAt.Equal(b.LastEventAt) {
+		return a.LastEventAt.After(b.LastEventAt)
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
+func acceptedResolution(event models.Event, candidate incidentCandidate) bool {
+	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
+		return true
+	}
+	if event.Service == "" || event.Service != candidate.Service {
+		return false
+	}
+	for label := range identityLabelScores {
+		if event.Labels[label] != "" && event.Labels[label] == candidate.Labels[label] {
+			return true
+		}
+	}
+	return false
+}
+
+type Correlator struct {
+	db            *sql.DB
+	timeWindow    time.Duration
+	interval      time.Duration
+	mode          string
+	mu            sync.Mutex
+	lastRun       time.Time
+	running       bool
+	wg            sync.WaitGroup
+	ctx           context.Context
+	cancelFunc    context.CancelFunc
+	startTime     time.Time
+	metrics       *metrics.Metrics
+	now           func() time.Time
+	newIncidentID func(time.Time) string
+}
+
 func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics) *Correlator {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Correlator{
-		db:         db,
-		timeWindow: timeWindow,
-		interval:   interval,
-		mode:       mode,
-		ctx:        ctx,
-		cancelFunc: cancel,
-		startTime:  time.Now(),
-		metrics:    m,
-	}
+	return &Correlator{db: db, timeWindow: timeWindow, interval: interval, mode: mode, ctx: ctx, cancelFunc: cancel, startTime: time.Now(), metrics: m, now: time.Now, newIncidentID: func(time.Time) string { return "inc_" + uuid.NewString() }}
 }
+func (c *Correlator) MuLock()              { c.mu.Lock() }
+func (c *Correlator) MuUnlock()            { c.mu.Unlock() }
+func (c *Correlator) LastRun() time.Time   { c.mu.Lock(); defer c.mu.Unlock(); return c.lastRun }
+func (c *Correlator) Running() bool        { c.mu.Lock(); defer c.mu.Unlock(); return c.running }
+func (c *Correlator) StartTime() time.Time { return c.startTime }
 
-// MuLock locks the correlator mutex
-func (c *Correlator) MuLock() {
-	c.mu.Lock()
-}
-
-// MuUnlock unlocks the correlator mutex
-func (c *Correlator) MuUnlock() {
-	c.mu.Unlock()
-}
-
-// LastRun returns the last run time
-func (c *Correlator) LastRun() time.Time {
-	return c.lastRun
-}
-
-// Running returns whether the correlator is running
-func (c *Correlator) Running() bool {
-	return c.running
-}
-
-// StartTime returns the start time
-func (c *Correlator) StartTime() time.Time {
-	return c.startTime
-}
-
-// Correlate performs one correlation cycle
 func (c *Correlator) Correlate() error {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
-		return nil // already running
+		return nil
 	}
 	c.running = true
-	c.metrics.CorrelatorRunning.Set(1)
+	if c.metrics != nil {
+		c.metrics.CorrelatorRunning.Set(1)
+	}
 	c.mu.Unlock()
-
 	defer func() {
 		c.mu.Lock()
 		c.running = false
-		c.metrics.CorrelatorRunning.Set(0)
+		if c.metrics != nil {
+			c.metrics.CorrelatorRunning.Set(0)
+		}
 		c.mu.Unlock()
 	}()
-
 	c.wg.Add(1)
 	defer c.wg.Done()
-
-	startTime := time.Now()
-	log.Info().Msg("Starting correlation cycle")
-
-	// Get uncorrelated events from the database
-	events, err := c.getUncorrelatedEvents()
-	if err != nil {
-		c.metrics.CorrelationCyclesTotal.WithLabelValues("error").Inc()
-		return err
+	start := c.now()
+	processed := 0
+	created := 0
+	for {
+		didProcess, didCreate, err := c.processNextEvent(c.ctx)
+		if err != nil {
+			if c.metrics != nil {
+				c.metrics.CorrelationCyclesTotal.WithLabelValues("error").Inc()
+			}
+			return err
+		}
+		if !didProcess {
+			break
+		}
+		processed++
+		if didCreate {
+			created++
+		}
 	}
-	if len(events) == 0 {
-		log.Info().Msg("No uncorrelated events found")
-		c.metrics.CorrelationCyclesTotal.WithLabelValues("success").Inc()
-		return nil
-	}
-
-	log.Info().Int("count", len(events)).Msg("Found uncorrelated events")
-	c.metrics.EventsProcessedTotal.Add(float64(len(events)))
-
-	// Group events into incidents
-	incidents := c.groupEventsIntoIncidents(events)
-	log.Info().Int("count", len(incidents)).Msg("Correlated into incidents")
-	c.metrics.IncidentsCreatedTotal.Add(float64(len(incidents)))
-
-	// Save incidents to database
-	if err := c.saveIncidents(incidents); err != nil {
-		c.metrics.CorrelationCyclesTotal.WithLabelValues("error").Inc()
-		return err
-	}
-
-	// Mark events as correlated
-	c.markEventsCorrelated(events)
-
 	c.mu.Lock()
-	c.lastRun = time.Now()
-	c.metrics.LastRunTimestamp.Set(float64(time.Now().Unix()))
+	c.lastRun = c.now()
 	c.mu.Unlock()
-
-	c.metrics.CycleDuration.Observe(time.Since(startTime).Seconds())
-	c.metrics.CorrelationCyclesTotal.WithLabelValues("success").Inc()
-
-	log.Info().Dur("duration", time.Since(startTime)).Msg("Correlation cycle completed")
+	if c.metrics != nil {
+		c.metrics.EventsProcessedTotal.Add(float64(processed))
+		c.metrics.IncidentsCreatedTotal.Add(float64(created))
+		c.metrics.LastRunTimestamp.Set(float64(c.lastRun.Unix()))
+		c.metrics.CycleDuration.Observe(c.now().Sub(start).Seconds())
+		c.metrics.CorrelationCyclesTotal.WithLabelValues("success").Inc()
+	}
 	return nil
 }
 
-// getUncorrelatedEvents fetches events that haven't been correlated yet
-func (c *Correlator) getUncorrelatedEvents() ([]models.Event, error) {
-	query := `
-		SELECT e.id, e.source, e.type, e.timestamp, e.service, e.environment, 
-		       e.severity, e.title, e.status, e.labels
-		FROM events e
-		LEFT JOIN incident_events ie ON e.id = ie.event_id
-		WHERE ie.event_id IS NULL
-		ORDER BY e.timestamp ASC
-	`
-
-	rows, err := c.db.QueryContext(c.ctx, query)
+func (c *Correlator) processNextEvent(ctx context.Context) (processed, created bool, err error) {
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return false, false, err
 	}
+	rollback := true
 	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close rows")
+		if rollback {
+			_ = tx.Rollback()
 		}
 	}()
-
-	var events []models.Event
+	var event models.Event
+	var labels []byte
+	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, e.source_event_id, e.type, e.occurred_at, e.service, e.environment, e.severity, e.title, e.status, e.labels FROM events e LEFT JOIN incident_events ie ON ie.event_id=e.id AND ie.policy_version=$1 WHERE ie.event_id IS NULL ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
+	scanErr := row.Scan(&event.ID, &event.Source, &event.SourceEventID, &event.Type, &event.Timestamp, &event.Service, &event.Environment, &event.Severity, &event.Title, &event.Status, &labels)
+	if scanErr != nil {
+		if scanErr == sql.ErrNoRows {
+			commitErr := tx.Commit()
+			if commitErr != nil {
+				return false, false, commitErr
+			}
+			rollback = false
+			return false, false, nil
+		}
+		return false, false, scanErr
+	}
+	unmarshalErr := json.Unmarshal(labels, &event.Labels)
+	if unmarshalErr != nil {
+		return false, false, unmarshalErr
+	}
+	rows, queryErr := tx.QueryContext(ctx, `SELECT i.id, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
+	if queryErr != nil {
+		return false, false, queryErr
+	}
+	var candidates []incidentCandidate
 	for rows.Next() {
-		var e models.Event
-		var labelsJSON []byte
-		if err := rows.Scan(
-			&e.ID, &e.Source, &e.Type, &e.Timestamp, &e.Service, &e.Environment,
-			&e.Severity, &e.Title, &e.Status, &labelsJSON,
-		); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(labelsJSON, &e.Labels); err != nil {
-			return nil, err
-		}
-		events = append(events, e)
-	}
-	return events, rows.Err()
-}
-
-// groupEventsIntoIncidents groups events using time window and service/label overlap
-func (c *Correlator) groupEventsIntoIncidents(events []models.Event) []models.Incident {
-	if len(events) == 0 {
-		return []models.Incident{}
-	}
-
-	// Sort events by timestamp (should already be sorted from query)
-	sort.Slice(events, func(i, j int) bool {
-		return events[i].Timestamp.Before(events[j].Timestamp)
-	})
-
-	var incidents []models.Incident
-	var currentGroup []models.Event
-
-	for _, event := range events {
-		if len(currentGroup) == 0 {
-			currentGroup = append(currentGroup, event)
-			continue
-		}
-
-		// Check if event belongs to current group
-		lastEvent := currentGroup[len(currentGroup)-1]
-		if c.eventsBelongTogether(lastEvent, event) {
-			currentGroup = append(currentGroup, event)
-		} else {
-			// Finalize current group and start new one
-			if len(currentGroup) > 0 {
-				incident := c.createIncidentFromGroup(currentGroup)
-				incidents = append(incidents, incident)
+		var x incidentCandidate
+		var services pq.StringArray
+		var lb []byte
+		scanErr := rows.Scan(&x.ID, &x.Status, &x.StartedAt, &x.LastEventAt, new(sql.NullTime), &x.Severity, &x.Environment, &services, &x.CreatedAt, &x.Service, &x.Source, &x.SourceEventID, &lb)
+		if scanErr != nil {
+			closeErr := rows.Close()
+			if closeErr != nil {
+				return false, false, closeErr
 			}
-			currentGroup = []models.Event{event}
+			return false, false, scanErr
 		}
-	}
-
-	// Don't forget the last group
-	if len(currentGroup) > 0 {
-		incident := c.createIncidentFromGroup(currentGroup)
-		incidents = append(incidents, incident)
-	}
-
-	return incidents
-}
-
-// eventsBelongTogether checks if two events should be in the same incident
-func (c *Correlator) eventsBelongTogether(e1, e2 models.Event) bool {
-	// Check time window
-	if e2.Timestamp.Sub(e1.Timestamp) > c.timeWindow {
-		return false
-	}
-
-	// Check service overlap (if both have service)
-	if e1.Service != "" && e2.Service != "" && e1.Service == e2.Service {
-		return true
-	}
-
-	// Check label overlap
-	for k, v := range e1.Labels {
-		if v2, exists := e2.Labels[k]; exists && v == v2 {
-			return true
-		}
-	}
-
-	return false
-}
-
-// createIncidentFromGroup creates an Incident from a group of events
-func (c *Correlator) createIncidentFromGroup(group []models.Event) models.Incident {
-	if len(group) == 0 {
-		return models.Incident{}
-	}
-
-	// Determine incident properties from the group
-	var services []string
-	serviceSet := make(map[string]bool)
-	var titles []string
-	var severities []string
-	var statuses []string
-	var minTime, maxTime time.Time
-
-	for i, event := range group {
-		if i == 0 {
-			minTime = event.Timestamp
-			maxTime = event.Timestamp
-		} else {
-			if event.Timestamp.Before(minTime) {
-				minTime = event.Timestamp
+		x.Labels = map[string]string{}
+		unmarshalErr := json.Unmarshal(lb, &x.Labels)
+		if unmarshalErr != nil {
+			closeErr := rows.Close()
+			if closeErr != nil {
+				return false, false, closeErr
 			}
-			if event.Timestamp.After(maxTime) {
-				maxTime = event.Timestamp
-			}
+			return false, false, unmarshalErr
 		}
-
-		if event.Service != "" && !serviceSet[event.Service] {
-			serviceSet[event.Service] = true
-			services = append(services, event.Service)
-		}
-		if event.Title != "" {
-			titles = append(titles, event.Title)
-		}
-		if event.Severity != "" {
-			severities = append(severities, event.Severity)
-		}
-		if event.Status != "" {
-			statuses = append(statuses, event.Status)
+		candidates = append(candidates, x)
+	}
+	closeErr := rows.Close()
+	if closeErr != nil {
+		return false, false, closeErr
+	}
+	rowsErr := rows.Err()
+	if rowsErr != nil {
+		return false, false, rowsErr
+	}
+	candidate, _, matched := selectCandidate(event, candidates)
+	incidentID := candidate.ID
+	now := c.now()
+	resolution := event.Status == "resolved" && matched && acceptedResolution(event, candidate)
+	reason := "new_incident"
+	if matched {
+		reason = "same_service_time_window"
+		if resolution {
+			reason = "resolution_of_open_incident"
 		}
 	}
-
-	// Determine incident title (most common or first)
-	title := "Infrastructure Incident"
-	if len(titles) > 0 {
-		title = titles[0] // simple: use first title
-	}
-
-	// Determine severity (highest)
-	severity := "info"
-	severityOrder := map[string]int{"critical": 5, "high": 4, "warning": 3, "info": 2, "debug": 1}
-	maxSeverity := 0
-	for _, s := range severities {
-		if val, ok := severityOrder[s]; ok && val > maxSeverity {
-			maxSeverity = val
-			severity = s
+	var execErr error
+	if !matched {
+		incidentID = c.newIncidentID(event.Timestamp)
+		_, execErr = tx.ExecContext(ctx, `INSERT INTO incidents (id,title,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at) VALUES ($1,$2,'open',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, incidentID, event.Title, event.Timestamp, nil, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now, now)
+		created = true
+	} else {
+		status := candidate.Status
+		if resolution {
+			status = "resolved"
 		}
+		_, execErr = tx.ExecContext(ctx, `UPDATE incidents SET title=$1,status=$2,last_event_at=GREATEST(last_event_at,$3),resolved_at=CASE WHEN $2='resolved' THEN GREATEST(COALESCE(resolved_at,$3),$3) ELSE resolved_at END,severity=$4,affected_services=$5,updated_at=$6 WHERE id=$7`, event.Title, status, event.Timestamp, event.Severity, pq.Array(nonEmpty(event.Service)), now, incidentID)
 	}
-
-	// Determine status (most severe or latest)
-	status := "firing"
-	statusOrder := map[string]int{"resolved": 0, "firing": 1}
-	maxStatus := 0
-	for _, s := range statuses {
-		if val, ok := statusOrder[s]; ok && val > maxStatus {
-			maxStatus = val
-			status = s
-		}
+	if execErr != nil {
+		return false, false, execErr
 	}
-
-	return models.Incident{
-		ID:           uuid.NewString(),
-		Title:        title,
-		Status:       status,
-		StartedAt:    minTime,
-		ResolvedAt:   maxTime,
-		Severity:     severity,
-		AffectedServices: services,
-		EventIDs:     c.extractEventIDs(group),
+	_, execErr = tx.ExecContext(ctx, `INSERT INTO incident_events (incident_id,event_id,correlation_reason,policy_version,attached_at) VALUES ($1,$2,$3,$4,$5)`, incidentID, event.ID, reason, correlationVersion, now)
+	if execErr != nil {
+		return false, false, execErr
 	}
+	key := investigationRequestKey(incidentID, event.ID)
+	_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$5,$5) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now)
+	if execErr != nil {
+		return false, false, execErr
+	}
+	commitErr := tx.Commit()
+	if commitErr != nil {
+		return false, false, commitErr
+	}
+	rollback = false
+	return true, created, nil
 }
 
-// extractEventIDs extracts IDs from a group of events
-func (c *Correlator) extractEventIDs(group []models.Event) []string {
-	ids := make([]string, len(group))
-	for i, event := range group {
-		ids[i] = event.ID
+func nonEmpty(s string) []string {
+	if s == "" {
+		return []string{}
 	}
-	return ids
+	return []string{s}
 }
-
-// saveIncidents inserts incidents into the database
-func (c *Correlator) saveIncidents(incidents []models.Incident) error {
-	if len(incidents) == 0 {
-		return nil
-	}
-
-	tx, err := c.db.BeginTx(c.ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			log.Error().Err(rbErr).Msg("Failed to rollback transaction")
-		}
-	}()
-
-	for _, incident := range incidents {
-		_, err := tx.ExecContext(c.ctx,
-			"INSERT INTO incidents (id, title, status, started_at, resolved_at, severity, affected_services) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-			incident.ID, incident.Title, incident.Status, incident.StartedAt, incident.ResolvedAt, incident.Severity, incident.AffectedServices,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Link events to incident
-		for _, eventID := range incident.EventIDs {
-			_, err := tx.ExecContext(c.ctx,
-				"INSERT INTO incident_events (incident_id, event_id) VALUES ($1,$2)",
-				incident.ID, eventID,
-			)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return tx.Commit()
+func investigationRequestKey(incidentID, eventID string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", incidentID, eventID, correlationVersion)))
+	return hex.EncodeToString(sum[:])
 }
+func outboxID(key string) string { return "irout_" + key[:26] }
 
-// markEventsCorrelated marks events as correlated by ensuring they appear in incident_events
-func (c *Correlator) markEventsCorrelated(events []models.Event) {
-	if len(events) == 0 {
-		return
-	}
-
-	// The saveIncidents function already creates the incident_events links
-	// This is a simplified approach - in reality we'd need to track which events belong to which incidents
-	// But since saveIncidents already does the linking, we can skip this step
-}
-
-// StartWorker starts the background correlation worker
 func (c *Correlator) StartWorker() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-c.ctx.Done():
-			log.Info().Msg("Correlation worker stopped")
 			return
 		case <-ticker.C:
 			if err := c.Correlate(); err != nil {
@@ -399,9 +317,6 @@ func (c *Correlator) StartWorker() {
 		}
 	}
 }
-
-// Stop stops the correlator gracefully
-func (c *Correlator) Stop() {
-	c.cancelFunc()
-	c.wg.Wait()
-}
+func (c *Correlator) Stop()           { c.cancelFunc(); c.wg.Wait() }
+func (c *Correlator) MuLockLegacy()   { c.mu.Lock() }
+func (c *Correlator) MuUnlockLegacy() { c.mu.Unlock() }
