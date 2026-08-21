@@ -18,11 +18,11 @@ import (
 
 // Config holds OTel configuration
 type Config struct {
-	ServiceName    string
-	OTLPEndpoint   string // e.g., "tempo:4317"
-	Insecure       bool
-	SampleRatio    float64 // 0.0 to 1.0
-	Enabled        bool
+	ServiceName  string
+	OTLPEndpoint string // e.g., "tempo:4317"
+	Insecure     bool
+	SampleRatio  float64 // 0.0 to 1.0
+	Enabled      bool
 }
 
 // InitTracer initializes the OpenTelemetry tracer provider with OTLP gRPC exporter

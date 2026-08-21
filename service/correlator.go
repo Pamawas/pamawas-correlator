@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -117,12 +119,33 @@ type Correlator struct {
 	metrics       *metrics.Metrics
 	now           func() time.Time
 	newIncidentID func(time.Time) string
+
+	// Investigation outbox worker
+	investigatorURL string
+	httpClient      *http.Client
+	outboxWg        sync.WaitGroup
 }
 
-func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics) *Correlator {
+func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL string) *Correlator {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Correlator{db: db, timeWindow: timeWindow, interval: interval, mode: mode, ctx: ctx, cancelFunc: cancel, startTime: time.Now(), metrics: m, now: time.Now, newIncidentID: func(time.Time) string { return "inc_" + uuid.NewString() }}
+	return &Correlator{
+		db:              db,
+		timeWindow:      timeWindow,
+		interval:        interval,
+		mode:            mode,
+		ctx:             ctx,
+		cancelFunc:      cancel,
+		startTime:       time.Now(),
+		metrics:         m,
+		now:             time.Now,
+		newIncidentID:   func(time.Time) string { return "inc_" + uuid.NewString() },
+		investigatorURL: investigatorURL,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
 }
+
 func (c *Correlator) MuLock()              { c.mu.Lock() }
 func (c *Correlator) MuUnlock()            { c.mu.Unlock() }
 func (c *Correlator) LastRun() time.Time   { c.mu.Lock(); defer c.mu.Unlock(); return c.lastRun }
@@ -297,11 +320,31 @@ func nonEmpty(s string) []string {
 	}
 	return []string{s}
 }
+
 func investigationRequestKey(incidentID, eventID string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", incidentID, eventID, correlationVersion)))
 	return hex.EncodeToString(sum[:])
 }
 func outboxID(key string) string { return "irout_" + key[:26] }
+
+func (c *Correlator) StartOutboxWorker() {
+	if c.investigatorURL == "" {
+		log.Info().Msg("Investigator URL not configured, skipping outbox worker")
+		return
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.processOutbox(); err != nil {
+				log.Error().Err(err).Msg("Outbox processing error")
+			}
+		}
+	}
+}
 
 func (c *Correlator) StartWorker() {
 	ticker := time.NewTicker(c.interval)
@@ -317,6 +360,149 @@ func (c *Correlator) StartWorker() {
 		}
 	}
 }
-func (c *Correlator) Stop()           { c.cancelFunc(); c.wg.Wait() }
-func (c *Correlator) MuLockLegacy()   { c.mu.Lock() }
-func (c *Correlator) MuUnlockLegacy() { c.mu.Unlock() }
+
+func (c *Correlator) processOutbox() error {
+	const batchSize = 10
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	rows, err := tx.QueryContext(c.ctx, `
+		SELECT id, incident_id, contract_version, request_key_hash
+		FROM investigation_outbox
+		WHERE status = 'pending'
+		ORDER BY created_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	`, batchSize)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type outboxItem struct {
+		id              string
+		incidentID      string
+		contractVersion int
+		requestKeyHash  string
+	}
+
+	var items []outboxItem
+	for rows.Next() {
+		var item outboxItem
+		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash); err != nil {
+			return err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(items) == 0 {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		rollback = false
+		return nil
+	}
+
+	for _, item := range items {
+		// Lease the outbox item
+		_, err := tx.ExecContext(c.ctx, `
+			UPDATE investigation_outbox
+			SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1
+			WHERE id = $1
+		`, item.id)
+		if err != nil {
+			return err
+		}
+
+		// Call investigator API
+		reqBody := map[string]interface{}{
+			"contract_version":    item.contractVersion,
+			"incident_id":         item.incidentID,
+			"reason":              "incident_created",
+			"correlation_version": item.contractVersion,
+		}
+		jsonBody, _ := json.Marshal(reqBody)
+
+		req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/v1/investigations", bytes.NewReader(jsonBody))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			// Mark as retryable
+			_, _ = tx.ExecContext(c.ctx, `
+				UPDATE investigation_outbox
+				SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
+				WHERE id = $1
+			`, item.id)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			// Success - mark delivered
+			_, err = tx.ExecContext(c.ctx, `
+				UPDATE investigation_outbox
+				SET status = 'delivered', updated_at = now()
+				WHERE id = $1
+			`, item.id)
+			if err != nil {
+				return err
+			}
+		} else if resp.StatusCode == 409 {
+			// Conflict - already processed, mark delivered
+			_, err = tx.ExecContext(c.ctx, `
+				UPDATE investigation_outbox
+				SET status = 'delivered', updated_at = now()
+				WHERE id = $1
+			`, item.id)
+			if err != nil {
+				return err
+			}
+		} else if resp.StatusCode >= 500 {
+			// Server error - retryable
+			_, err = tx.ExecContext(c.ctx, `
+				UPDATE investigation_outbox
+				SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
+				WHERE id = $1
+			`, item.id)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Client error - terminal failure
+			_, err = tx.ExecContext(c.ctx, `
+				UPDATE investigation_outbox
+				SET status = 'failed_terminal', safe_error_code = 'INVESTIGATOR_ERROR', updated_at = now()
+				WHERE id = $1
+			`, item.id)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	rollback = false
+	return nil
+}
+
+func (c *Correlator) Stop() {
+	c.cancelFunc()
+	c.wg.Wait()
+}

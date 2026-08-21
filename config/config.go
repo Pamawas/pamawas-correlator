@@ -8,13 +8,13 @@ import (
 )
 
 type Config struct {
-	DatabaseURL  string
-	Port         string
-	LogLevel     string
-	Environment  string
-	TimeWindow   time.Duration
-	Interval     time.Duration
-	Mode         string
+	DatabaseURL string
+	Port        string
+	LogLevel    string
+	Environment string
+	TimeWindow  time.Duration
+	Interval    time.Duration
+	Mode        string
 }
 
 func Load() Config {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -26,7 +27,9 @@ type Handler struct {
 
 // NewHandler creates a new handler with dependencies
 func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics) *Handler {
-	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m)
+	// Get investigator URL from environment
+	investigatorURL := os.Getenv("INVESTIGATOR_URL")
+	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL)
 
 	return &Handler{
 		correlator: correlator,
@@ -64,12 +67,12 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(models.HealthResponse{
-		Status:      "healthy",
-		Timestamp:   time.Now().UTC(),
-		LastRun:     lastRun,
-		Running:     running,
-		TimeWindow:  h.cfg.TimeWindow.String(),
-		Version:     "1.0.0",
+		Status:     "healthy",
+		Timestamp:  time.Now().UTC(),
+		LastRun:    lastRun,
+		Running:    running,
+		TimeWindow: h.cfg.TimeWindow.String(),
+		Version:    "1.0.0",
 	}); err != nil {
 		log.Error().Err(err).Msg("Failed to encode health response")
 	}

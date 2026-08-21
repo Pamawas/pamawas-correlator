@@ -83,7 +83,8 @@ func main() {
 	m := metrics.NewMetrics()
 
 	// Initialize correlator service
-	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m)
+	investigatorURL := os.Getenv("INVESTIGATOR_URL")
+	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL)
 
 	// Initialize handlers
 	h := handlers.NewHandler(db, cfg, m)
@@ -91,6 +92,7 @@ func main() {
 	// Start background worker if not in manual mode
 	if cfg.Mode != "manual" {
 		go correlator.StartWorker()
+		go correlator.StartOutboxWorker()
 	}
 
 	// Create router
