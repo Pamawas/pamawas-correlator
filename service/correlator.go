@@ -123,7 +123,6 @@ type Correlator struct {
 	// Investigation outbox worker
 	investigatorURL string
 	httpClient      *http.Client
-	outboxWg        sync.WaitGroup
 }
 
 func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL string) *Correlator {
@@ -385,7 +384,11 @@ func (c *Correlator) processOutbox() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close rows")
+		}
+	}()
 
 	type outboxItem struct {
 		id              string
@@ -450,7 +453,11 @@ func (c *Correlator) processOutbox() error {
 			`, item.id)
 			continue
 		}
-		resp.Body.Close()
+		defer func() {
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				log.Error().Err(closeErr).Msg("Failed to close response body")
+			}
+		}()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			// Success - mark delivered
