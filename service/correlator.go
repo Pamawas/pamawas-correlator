@@ -212,7 +212,9 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	rollback := true
 	defer func() {
 		if rollback {
-			_ = tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
 		}
 	}()
 	var event models.Event
@@ -369,7 +371,9 @@ func (c *Correlator) processOutbox() error {
 	rollback := true
 	defer func() {
 		if rollback {
-			_ = tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
 		}
 	}()
 
@@ -435,7 +439,10 @@ func (c *Correlator) processOutbox() error {
 			"reason":              "incident_created",
 			"correlation_version": item.contractVersion,
 		}
-		jsonBody, _ := json.Marshal(reqBody)
+		jsonBody, err := json.Marshal(reqBody)
+		if err != nil {
+			return err
+		}
 
 		req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/v1/investigations", bytes.NewReader(jsonBody))
 		if err != nil {
@@ -446,11 +453,13 @@ func (c *Correlator) processOutbox() error {
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			// Mark as retryable
-			_, _ = tx.ExecContext(c.ctx, `
+			if _, rbErr := tx.ExecContext(c.ctx, `
 				UPDATE investigation_outbox
 				SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
 				WHERE id = $1
-			`, item.id)
+			`, item.id); rbErr != nil {
+				return rbErr
+			}
 			continue
 		}
 		defer func() {
