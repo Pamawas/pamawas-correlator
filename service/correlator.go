@@ -217,10 +217,8 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 			}
 		}
 	}()
-	var event models.Event
-	var labels []byte
-	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, e.source_event_id, e.type, e.occurred_at, e.service, e.environment, e.severity, e.title, e.status, e.labels FROM events e LEFT JOIN incident_events ie ON ie.event_id=e.id AND ie.policy_version=$1 WHERE ie.event_id IS NULL ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
-	scanErr := row.Scan(&event.ID, &event.Source, &event.SourceEventID, &event.Type, &event.Timestamp, &event.Service, &event.Environment, &event.Severity, &event.Title, &event.Status, &labels)
+
+	event, scanErr := fetchPendingEvent(ctx, tx)
 	if scanErr != nil {
 		if scanErr == sql.ErrNoRows {
 			commitErr := tx.Commit()
@@ -232,73 +230,20 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 		}
 		return false, false, scanErr
 	}
-	unmarshalErr := json.Unmarshal(labels, &event.Labels)
-	if unmarshalErr != nil {
-		return false, false, unmarshalErr
+
+	candidates, err := loadAdjacentCandidates(ctx, tx, event)
+	if err != nil {
+		return false, false, err
 	}
-	rows, queryErr := tx.QueryContext(ctx, `SELECT i.id, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
-	if queryErr != nil {
-		return false, false, queryErr
-	}
-	var candidates []incidentCandidate
-	for rows.Next() {
-		var x incidentCandidate
-		var services pq.StringArray
-		var lb []byte
-		scanErr := rows.Scan(&x.ID, &x.Status, &x.StartedAt, &x.LastEventAt, new(sql.NullTime), &x.Severity, &x.Environment, &services, &x.CreatedAt, &x.Service, &x.Source, &x.SourceEventID, &lb)
-		if scanErr != nil {
-			closeErr := rows.Close()
-			if closeErr != nil {
-				return false, false, closeErr
-			}
-			return false, false, scanErr
-		}
-		x.Labels = map[string]string{}
-		unmarshalErr := json.Unmarshal(lb, &x.Labels)
-		if unmarshalErr != nil {
-			closeErr := rows.Close()
-			if closeErr != nil {
-				return false, false, closeErr
-			}
-			return false, false, unmarshalErr
-		}
-		candidates = append(candidates, x)
-	}
-	closeErr := rows.Close()
-	if closeErr != nil {
-		return false, false, closeErr
-	}
-	rowsErr := rows.Err()
-	if rowsErr != nil {
-		return false, false, rowsErr
-	}
+
 	candidate, _, matched := selectCandidate(event, candidates)
-	incidentID := candidate.ID
 	now := c.now()
-	resolution := event.Status == "resolved" && matched && acceptedResolution(event, candidate)
-	reason := "new_incident"
-	if matched {
-		reason = "same_service_time_window"
-		if resolution {
-			reason = "resolution_of_open_incident"
-		}
+	incidentID, reason, created, mutationErr := c.applyIncidentMutation(ctx, tx, event, candidate, matched, now)
+	if mutationErr != nil {
+		return false, false, mutationErr
 	}
-	var execErr error
-	if !matched {
-		incidentID = c.newIncidentID(event.Timestamp)
-		_, execErr = tx.ExecContext(ctx, `INSERT INTO incidents (id,title,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at) VALUES ($1,$2,'open',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, incidentID, event.Title, event.Timestamp, nil, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now, now)
-		created = true
-	} else {
-		status := candidate.Status
-		if resolution {
-			status = "resolved"
-		}
-		_, execErr = tx.ExecContext(ctx, `UPDATE incidents SET title=$1,status=$2,last_event_at=GREATEST(last_event_at,$3),resolved_at=CASE WHEN $2='resolved' THEN GREATEST(COALESCE(resolved_at,$3),$3) ELSE resolved_at END,severity=$4,affected_services=$5,updated_at=$6 WHERE id=$7`, event.Title, status, event.Timestamp, event.Severity, pq.Array(nonEmpty(event.Service)), now, incidentID)
-	}
-	if execErr != nil {
-		return false, false, execErr
-	}
-	_, execErr = tx.ExecContext(ctx, `INSERT INTO incident_events (incident_id,event_id,correlation_reason,policy_version,attached_at) VALUES ($1,$2,$3,$4,$5)`, incidentID, event.ID, reason, correlationVersion, now)
+
+	_, execErr := tx.ExecContext(ctx, `INSERT INTO incident_events (incident_id,event_id,correlation_reason,policy_version,attached_at) VALUES ($1,$2,$3,$4,$5)`, incidentID, event.ID, reason, correlationVersion, now)
 	if execErr != nil {
 		return false, false, execErr
 	}
@@ -313,6 +258,96 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	}
 	rollback = false
 	return true, created, nil
+}
+
+// fetchPendingEvent selects the next unprocessed event from the transaction.
+// Returns sql.ErrNoRows when no pending event exists.
+func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
+	var event models.Event
+	var labels []byte
+	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, e.source_event_id, e.type, e.occurred_at, e.service, e.environment, e.severity, e.title, e.status, e.labels FROM events e LEFT JOIN incident_events ie ON ie.event_id=e.id AND ie.policy_version=$1 WHERE ie.event_id IS NULL ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
+	if err := row.Scan(&event.ID, &event.Source, &event.SourceEventID, &event.Type, &event.Timestamp, &event.Service, &event.Environment, &event.Severity, &event.Title, &event.Status, &labels); err != nil {
+		return event, err
+	}
+	if err := json.Unmarshal(labels, &event.Labels); err != nil {
+		return event, err
+	}
+	return event, nil
+}
+
+// loadAdjacentCandidates queries open/investigating incidents in the same
+// environment that fall within the time-correlation window of the event.
+func loadAdjacentCandidates(ctx context.Context, tx *sql.Tx, event models.Event) ([]incidentCandidate, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT i.id, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close rows")
+		}
+	}()
+
+	var candidates []incidentCandidate
+	for rows.Next() {
+		x, scanErr := scanCandidate(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		candidates = append(candidates, x)
+	}
+	return candidates, rows.Err()
+}
+
+// scanCandidate extracts a single incidentCandidate from a rows iterator.
+func scanCandidate(rows *sql.Rows) (incidentCandidate, error) {
+	var x incidentCandidate
+	var services pq.StringArray
+	var lb []byte
+	if err := rows.Scan(&x.ID, &x.Status, &x.StartedAt, &x.LastEventAt, new(sql.NullTime), &x.Severity, &x.Environment, &services, &x.CreatedAt, &x.Service, &x.Source, &x.SourceEventID, &lb); err != nil {
+		return x, err
+	}
+	x.Labels = map[string]string{}
+	if err := json.Unmarshal(lb, &x.Labels); err != nil {
+		return x, err
+	}
+	return x, nil
+}
+
+// applyIncidentMutation decides whether to INSERT a new incident or UPDATE an
+// existing matched candidate, then executes the appropriate statement.
+// Returns the resolved incident ID, correlation reason, whether a new incident
+// was created, and any execution error.
+func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, event models.Event, candidate incidentCandidate, matched bool, now time.Time) (string, string, bool, error) {
+	reduction := event.Status == "resolved" && matched && acceptedResolution(event, candidate)
+	reason := "new_incident"
+	if matched {
+		reason = "same_service_time_window"
+		if reduction {
+			reason = "resolution_of_open_incident"
+		}
+	}
+	var created bool
+	var incidentID string
+	if !matched {
+		incidentID = c.newIncidentID(event.Timestamp)
+		_, err := tx.ExecContext(ctx, `INSERT INTO incidents (id,title,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at) VALUES ($1,$2,'open',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, incidentID, event.Title, event.Timestamp, nil, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now, now)
+		if err != nil {
+			return "", "", false, err
+		}
+		created = true
+	} else {
+		incidentID = candidate.ID
+		status := candidate.Status
+		if reduction {
+			status = "resolved"
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE incidents SET title=$1,status=$2,last_event_at=GREATEST(last_event_at,$3),resolved_at=CASE WHEN $2='resolved' THEN GREATEST(COALESCE(resolved_at,$3),$3) ELSE resolved_at END,severity=$4,affected_services=$5,updated_at=$6 WHERE id=$7`, event.Title, status, event.Timestamp, event.Severity, pq.Array(nonEmpty(event.Service)), now, incidentID)
+		if err != nil {
+			return "", "", false, err
+		}
+	}
+	return incidentID, reason, created, nil
 }
 
 func nonEmpty(s string) []string {
@@ -362,6 +397,14 @@ func (c *Correlator) StartWorker() {
 	}
 }
 
+// outboxItem represents a single pending entry in the investigation_outbox table.
+type outboxItem struct {
+	id              string
+	incidentID      string
+	contractVersion int
+	requestKeyHash  string
+}
+
 func (c *Correlator) processOutbox() error {
 	const batchSize = 10
 	tx, err := c.db.BeginTx(c.ctx, nil)
@@ -394,25 +437,10 @@ func (c *Correlator) processOutbox() error {
 		}
 	}()
 
-	type outboxItem struct {
-		id              string
-		incidentID      string
-		contractVersion int
-		requestKeyHash  string
-	}
-
-	var items []outboxItem
-	for rows.Next() {
-		var item outboxItem
-		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash); err != nil {
-			return err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
+	items, err := scanOutboxRows(rows)
+	if err != nil {
 		return err
 	}
-
 	if len(items) == 0 {
 		if err := tx.Commit(); err != nil {
 			return err
@@ -422,92 +450,8 @@ func (c *Correlator) processOutbox() error {
 	}
 
 	for _, item := range items {
-		// Lease the outbox item
-		_, err := tx.ExecContext(c.ctx, `
-			UPDATE investigation_outbox
-			SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1
-			WHERE id = $1
-		`, item.id)
-		if err != nil {
+		if err := c.processOutboxItem(tx, item); err != nil {
 			return err
-		}
-
-		// Call investigator API
-		reqBody := map[string]interface{}{
-			"contract_version":    item.contractVersion,
-			"incident_id":         item.incidentID,
-			"reason":              "incident_created",
-			"correlation_version": item.contractVersion,
-		}
-		jsonBody, err := json.Marshal(reqBody)
-		if err != nil {
-			return err
-		}
-
-		req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/v1/investigations", bytes.NewReader(jsonBody))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			// Mark as retryable
-			if _, rbErr := tx.ExecContext(c.ctx, `
-				UPDATE investigation_outbox
-				SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
-				WHERE id = $1
-			`, item.id); rbErr != nil {
-				return rbErr
-			}
-			continue
-		}
-		defer func() {
-			if closeErr := resp.Body.Close(); closeErr != nil {
-				log.Error().Err(closeErr).Msg("Failed to close response body")
-			}
-		}()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			// Success - mark delivered
-			_, err = tx.ExecContext(c.ctx, `
-				UPDATE investigation_outbox
-				SET status = 'delivered', updated_at = now()
-				WHERE id = $1
-			`, item.id)
-			if err != nil {
-				return err
-			}
-		} else if resp.StatusCode == 409 {
-			// Conflict - already processed, mark delivered
-			_, err = tx.ExecContext(c.ctx, `
-				UPDATE investigation_outbox
-				SET status = 'delivered', updated_at = now()
-				WHERE id = $1
-			`, item.id)
-			if err != nil {
-				return err
-			}
-		} else if resp.StatusCode >= 500 {
-			// Server error - retryable
-			_, err = tx.ExecContext(c.ctx, `
-				UPDATE investigation_outbox
-				SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
-				WHERE id = $1
-			`, item.id)
-			if err != nil {
-				return err
-			}
-		} else {
-			// Client error - terminal failure
-			_, err = tx.ExecContext(c.ctx, `
-				UPDATE investigation_outbox
-				SET status = 'failed_terminal', safe_error_code = 'INVESTIGATOR_ERROR', updated_at = now()
-				WHERE id = $1
-			`, item.id)
-			if err != nil {
-				return err
-			}
 		}
 	}
 
@@ -516,6 +460,109 @@ func (c *Correlator) processOutbox() error {
 	}
 	rollback = false
 	return nil
+}
+
+// scanOutboxRows reads all pending outbox items from the rows iterator.
+func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
+	var items []outboxItem
+	for rows.Next() {
+		var item outboxItem
+		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// processOutboxItem leases a single outbox item, calls the investigator API,
+// and applies the response status to the outbox record.
+func (c *Correlator) processOutboxItem(tx *sql.Tx, item outboxItem) error {
+	if err := c.leaseOutboxItem(tx, item); err != nil {
+		return err
+	}
+
+	reqBody := map[string]interface{}{
+		"contract_version":    item.contractVersion,
+		"incident_id":         item.incidentID,
+		"reason":              "incident_created",
+		"correlation_version": item.contractVersion,
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/v1/investigations", bytes.NewReader(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return c.markOutboxRetryable(tx, item.id)
+	}
+
+	if err := c.applyOutboxResponseStatus(tx, item.id, resp); err != nil {
+		return err
+	}
+
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close response body")
+		}
+	}()
+	return nil
+}
+
+// leaseOutboxItem transitions a single outbox item to the 'leased' state.
+func (c *Correlator) leaseOutboxItem(tx *sql.Tx, item outboxItem) error {
+	_, err := tx.ExecContext(c.ctx, `
+		UPDATE investigation_outbox
+		SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1
+		WHERE id = $1
+	`, item.id)
+	return err
+}
+
+// markOutboxRetryable transitions a single outbox item to the 'retryable' state
+// after a transient error (e.g. HTTP transport failure).
+func (c *Correlator) markOutboxRetryable(tx *sql.Tx, id string) error {
+	_, err := tx.ExecContext(c.ctx, `
+		UPDATE investigation_outbox
+		SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
+		WHERE id = $1
+	`, id)
+	return err
+}
+
+// applyOutboxResponseStatus maps an investigator HTTP response status code to the
+// corresponding outbox status update.
+func (c *Correlator) applyOutboxResponseStatus(tx *sql.Tx, itemID string, resp *http.Response) error {
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return c.updateOutboxStatus(tx, itemID, "delivered", "")
+	case resp.StatusCode == 409:
+		return c.updateOutboxStatus(tx, itemID, "delivered", "")
+	case resp.StatusCode >= 500:
+		return c.updateOutboxStatus(tx, itemID, "retryable", "")
+	default:
+		return c.updateOutboxStatus(tx, itemID, "failed_terminal", "'INVESTIGATOR_ERROR'")
+	}
+}
+
+// updateOutboxStatus runs the UPDATE that transitions an outbox item to the
+// given status, optionally setting safe_error_code.
+func (c *Correlator) updateOutboxStatus(tx *sql.Tx, id, status, safeErrorCode string) error {
+	query := `UPDATE investigation_outbox SET status = $1, updated_at = now() WHERE id = $2`
+	args := []interface{}{status, id}
+	if safeErrorCode != "" {
+		query = `UPDATE investigation_outbox SET status = $1, safe_error_code = $2, updated_at = now() WHERE id = $3`
+		args = []interface{}{status, safeErrorCode, id}
+	}
+	_, err := tx.ExecContext(c.ctx, query, args...)
+	return err
 }
 
 func (c *Correlator) Stop() {
