@@ -265,7 +265,7 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	var event models.Event
 	var labels []byte
-	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, e.source_event_id, e.type, e.occurred_at, e.service, e.environment, e.severity, e.title, e.status, e.labels FROM events e LEFT JOIN incident_events ie ON ie.event_id=e.id AND ie.policy_version=$1 WHERE ie.event_id IS NULL ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
+	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, e.source_event_id, e.type, e.occurred_at, e.service, e.environment, e.severity, e.title, e.status, e.labels FROM events e WHERE NOT EXISTS (SELECT 1 FROM incident_events ie WHERE ie.event_id = e.id AND ie.policy_version = $1) ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
 	if err := row.Scan(&event.ID, &event.Source, &event.SourceEventID, &event.Type, &event.Timestamp, &event.Service, &event.Environment, &event.Severity, &event.Title, &event.Status, &labels); err != nil {
 		return event, err
 	}
