@@ -28,7 +28,9 @@ func Load() Config {
 	v.AutomaticEnv()
 
 	// Also bind standard env var names (without prefix)
-	_ = v.BindEnv("database_url", "DATABASE_URL")
+	if err := v.BindEnv("database_url", "DATABASE_URL"); err != nil {
+		panic(fmt.Sprintf("failed to bind DATABASE_URL env: %v", err))
+	}
 
 	// Defaults
 	v.SetDefault("port", "8080")
