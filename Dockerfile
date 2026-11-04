@@ -1,33 +1,32 @@
-# Use the official Golang image to build the application
-FROM golang:1.27-alpine AS builder
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
-# Set the working directory inside the container
+ARG TARGETOS
+ARG TARGETARCH
+
 WORKDIR /app
 
-# Copy go.mod and go.sum files
-COPY go.mod ./
-RUN go mod download 2>/dev/null || true
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Copy the source code
 COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /pamawas-correlator .
 
-# Build the application
-RUN go build -o main .
+ARG VERSION=""
+RUN if [ -n "$VERSION" ]; then printf '%s\n' "$VERSION" > /app/version.txt; elif [ ! -f /app/version.txt ]; then printf 'dev-unknown\n' > /app/version.txt; fi
 
-# Use a minimal alpine image to run the application
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS calls
 RUN apk --no-cache add ca-certificates
 
-# Set the working directory
-WORKDIR /root/
+WORKDIR /app
+COPY --from=builder /pamawas-correlator .
+COPY --from=builder /app/version.txt ./version.txt
 
-# Copy the pre-built binary from the builder stage
-COPY --from=builder /app/main .
-
-# Expose port 8080 (adjust as needed)
 EXPOSE 8080
 
-# Command to run the executable
-CMD ["./main"]
+CMD ["./pamawas-correlator"]
