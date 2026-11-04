@@ -106,7 +106,7 @@ func main() {
 	// V1 API endpoints under /api/v1
 	r.HandleFunc("/api/v1/trigger", h.TriggerHandler)
 	r.HandleFunc("/api/v1/status", h.StatusHandler)
-	r.Handle("/api/v1/metrics", h.MetricsHandler())
+	registerMetricsRoutes(r, h.MetricsHandler())
 
 	// Wrap router with middleware
 	var handler http.Handler = r
@@ -144,6 +144,10 @@ func main() {
 	}
 
 	log.Info().Msg("Server stopped gracefully")
+}
+
+func registerMetricsRoutes(r *http.ServeMux, metricsHandler http.Handler) {
+	r.Handle("/metrics", metricsHandler)
 }
 
 func initLogger(cfg config.Config) {
