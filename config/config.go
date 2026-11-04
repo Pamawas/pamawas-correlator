@@ -28,7 +28,7 @@ func Load() Config {
 	v.AutomaticEnv()
 
 	// Also bind standard env var names (without prefix)
-	v.BindEnv("database_url", "DATABASE_URL")
+	_ = v.BindEnv("database_url", "DATABASE_URL")
 
 	// Defaults
 	v.SetDefault("port", "8080")
