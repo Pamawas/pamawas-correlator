@@ -27,25 +27,25 @@ func Load() Config {
 	v.SetEnvPrefix("PAMAWAS_CORRELATOR")
 	// Don't use AutomaticEnv() - Kubernetes injects PAMAWAS_CORRELATOR_PORT=tcp://IP:PORT
 	// which would override our config. Explicitly bind only what we need.
-	if err := v.BindEnv("database_url", "DATABASE_URL"); err != nil {
+	if err := v.BindEnv("database_url", "DATABASE_URL", "PAMAWAS_CORRELATOR_DATABASE_URL"); err != nil {
 		panic(fmt.Sprintf("failed to bind DATABASE_URL env: %v", err))
 	}
-	if err := v.BindEnv("port", "PORT"); err != nil {
+	if err := v.BindEnv("port", "PORT", "PAMAWAS_CORRELATOR_PORT"); err != nil {
 		panic(fmt.Sprintf("failed to bind PORT env: %v", err))
 	}
-	if err := v.BindEnv("log_level", "LOG_LEVEL"); err != nil {
+	if err := v.BindEnv("log_level", "LOG_LEVEL", "PAMAWAS_CORRELATOR_LOG_LEVEL"); err != nil {
 		panic(fmt.Sprintf("failed to bind LOG_LEVEL env: %v", err))
 	}
-	if err := v.BindEnv("environment", "ENVIRONMENT"); err != nil {
+	if err := v.BindEnv("environment", "ENVIRONMENT", "PAMAWAS_CORRELATOR_ENVIRONMENT"); err != nil {
 		panic(fmt.Sprintf("failed to bind ENVIRONMENT env: %v", err))
 	}
-	if err := v.BindEnv("time_window", "CORRELATION_TIME_WINDOW"); err != nil {
+	if err := v.BindEnv("time_window", "CORRELATION_TIME_WINDOW", "PAMAWAS_CORRELATOR_CORRELATION_TIME_WINDOW"); err != nil {
 		panic(fmt.Sprintf("failed to bind CORRELATION_TIME_WINDOW env: %v", err))
 	}
-	if err := v.BindEnv("interval", "CORRELATION_INTERVAL"); err != nil {
+	if err := v.BindEnv("interval", "CORRELATION_INTERVAL", "PAMAWAS_CORRELATOR_CORRELATION_INTERVAL"); err != nil {
 		panic(fmt.Sprintf("failed to bind CORRELATION_INTERVAL env: %v", err))
 	}
-	if err := v.BindEnv("mode", "CORRELATOR_MODE"); err != nil {
+	if err := v.BindEnv("mode", "CORRELATOR_MODE", "PAMAWAS_CORRELATOR_MODE"); err != nil {
 		panic(fmt.Sprintf("failed to bind CORRELATOR_MODE env: %v", err))
 	}
 
