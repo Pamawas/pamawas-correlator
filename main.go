@@ -21,6 +21,9 @@ import (
 	"github.com/Pamawas/pamawas-correlator/service"
 )
 
+// version is set at build time via -ldflags
+var version = "dev"
+
 func main() {
 	cfg := config.Load()
 	initLogger(cfg)
