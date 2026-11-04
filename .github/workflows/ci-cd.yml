@@ -39,6 +39,7 @@ jobs:
       uses: golangci/golangci-lint-action@v7
       with:
         install-mode: 'goinstall'
+        version: v2.13.2
         args: ./...
 
   build:
@@ -52,7 +53,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.26.6'
+        go-version: '1.27'
         cache: true
 
     - name: Download dependencies
@@ -105,6 +106,7 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: .
+        file: Dockerfile
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
