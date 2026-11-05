@@ -149,8 +149,8 @@ func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, 
 
 func (c *Correlator) MuLock()              { c.mu.Lock() }
 func (c *Correlator) MuUnlock()            { c.mu.Unlock() }
-func (c *Correlator) LastRun() time.Time   { c.mu.Lock(); defer c.mu.Unlock(); return c.lastRun }
-func (c *Correlator) Running() bool        { c.mu.Lock(); defer c.mu.Unlock(); return c.running }
+func (c *Correlator) LastRun() time.Time   { return c.lastRun }
+func (c *Correlator) Running() bool        { return c.running }
 func (c *Correlator) StartTime() time.Time { return c.startTime }
 
 func (c *Correlator) Correlate() error {
