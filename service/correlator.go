@@ -122,10 +122,11 @@ type Correlator struct {
 
 	// Investigation outbox worker
 	investigatorURL string
+	serviceToken    string
 	httpClient      *http.Client
 }
 
-func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL string) *Correlator {
+func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL, serviceToken string) *Correlator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Correlator{
 		db:              db,
@@ -139,6 +140,7 @@ func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, 
 		now:             time.Now,
 		newIncidentID:   func(time.Time) string { return "inc_" + uuid.NewString() },
 		investigatorURL: investigatorURL,
+		serviceToken:    serviceToken,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -493,11 +495,14 @@ func (c *Correlator) processOutboxItem(tx *sql.Tx, item outboxItem) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/v1/investigations", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/api/v1/investigations", bytes.NewReader(jsonBody))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.serviceToken != "" {
+		req.Header.Set("X-Service-Token", c.serviceToken)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
