@@ -426,6 +426,8 @@ func (c *Correlator) processOutbox() error {
 		SELECT id, incident_id, contract_version, request_key_hash
 		FROM investigation_outbox
 		WHERE status = 'pending'
+		   OR (status = 'retryable' AND next_attempt_at <= now())
+		   OR (status = 'leased' AND lease_expires_at <= now())
 		ORDER BY created_at
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
