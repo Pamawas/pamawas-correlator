@@ -74,6 +74,30 @@ func TestResolutionRequiresAcceptedIdentity(t *testing.T) {
 	}
 }
 
+func TestGrafanaFingerprintMatchesResolutionCandidate(t *testing.T) {
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	event := models.Event{
+		Source:      "grafana",
+		Timestamp:   base,
+		Service:     "api",
+		Environment: "prod",
+		Status:      "resolved",
+		Labels:      map[string]string{"grafana_fingerprint": "fingerprint-1"},
+	}
+	candidates := []incidentCandidate{
+		{ID: "wrong", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), Environment: "prod", Service: "api", Source: "grafana", Labels: map[string]string{"grafana_fingerprint": "fingerprint-2"}},
+		{ID: "match", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), Environment: "prod", Service: "api", Source: "grafana", Labels: map[string]string{"grafana_fingerprint": "fingerprint-1"}},
+	}
+
+	got, score, ok := selectCandidate(event, candidates)
+	if !ok || got.ID != "match" || score != 150 {
+		t.Fatalf("selected %+v score %d ok %v, want matching fingerprint candidate with score 150", got, score, ok)
+	}
+	if !acceptedResolution(event, got) {
+		t.Fatal("matching Grafana fingerprint should authorize resolution")
+	}
+}
+
 func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

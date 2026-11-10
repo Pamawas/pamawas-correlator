@@ -68,6 +68,9 @@ func candidateScore(event models.Event, candidate incidentCandidate) int {
 	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
 		score += 100
 	}
+	if grafanaFingerprintMatches(event, candidate) {
+		score += 100
+	}
 	if event.Service != "" && event.Service == candidate.Service {
 		score += 50
 	}
@@ -93,6 +96,9 @@ func acceptedResolution(event models.Event, candidate incidentCandidate) bool {
 	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
 		return true
 	}
+	if grafanaFingerprintMatches(event, candidate) {
+		return true
+	}
 	if event.Service == "" || event.Service != candidate.Service {
 		return false
 	}
@@ -102,6 +108,12 @@ func acceptedResolution(event models.Event, candidate incidentCandidate) bool {
 		}
 	}
 	return false
+}
+
+func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) bool {
+	fingerprint := event.Labels["grafana_fingerprint"]
+	return event.Source == "grafana" && candidate.Source == "grafana" &&
+		fingerprint != "" && fingerprint == candidate.Labels["grafana_fingerprint"]
 }
 
 type Correlator struct {
@@ -280,7 +292,7 @@ func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 // loadAdjacentCandidates queries open/investigating incidents in the same
 // environment that fall within the time-correlation window of the event.
 func loadAdjacentCandidates(ctx context.Context, tx *sql.Tx, event models.Event) ([]incidentCandidate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT i.id, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
+	rows, err := tx.QueryContext(ctx, `SELECT i.id, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels || CASE WHEN e2.source='grafana' AND NULLIF(e2.raw_payload->'alerts'->0->>'fingerprint','') IS NOT NULL THEN jsonb_build_object('grafana_fingerprint', e2.raw_payload->'alerts'->0->>'fingerprint') ELSE '{}'::jsonb END FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
 	if err != nil {
 		return nil, err
 	}
