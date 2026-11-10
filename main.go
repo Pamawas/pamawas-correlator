@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog"

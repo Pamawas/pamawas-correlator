@@ -21,7 +21,7 @@ RUN if [ -n "$VERSION" ]; then printf '%s\n' "$VERSION" > /app/version.txt; elif
 
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=builder /pamawas-correlator .
