@@ -31,7 +31,7 @@ type Handler struct {
 func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics, investigatorURL string) *Handler {
 	// Get investigator URL from environment
 	serviceToken := os.Getenv("PAMAWAS_SERVICE_TOKEN")
-	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL, serviceToken, cfg)
+	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL, serviceToken)
 
 	return &Handler{
 		correlator:    correlator,
