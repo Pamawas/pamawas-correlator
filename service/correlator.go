@@ -696,16 +696,32 @@ func (c *Correlator) leaseOutboxItem(tx *sql.Tx, item outboxItem) error {
 	return err
 }
 
+// computeOutboxBackoff returns the exponential backoff duration for an outbox
+// item retry. Backoff grows 1m, 2m, 4m, 8m, 16m, 32m and is capped at 1 hour.
+// It is computed in minutes first (as int64) to avoid time.Duration (int64 ns)
+// overflow when attempts is large, then converted to time.Duration.
+func computeOutboxBackoff(attempts int) time.Duration {
+	backoffMinutes := int64(1)
+	if attempts > 0 {
+		shift := uint(attempts)
+		if shift > 6 {
+			shift = 6 // 1<<6 = 64 minutes, capped to 60 below
+		}
+		backoffMinutes = int64(1) << shift
+	}
+	if backoffMinutes > 60 {
+		backoffMinutes = 60
+	}
+	if backoffMinutes < 1 {
+		backoffMinutes = 1
+	}
+	return time.Duration(backoffMinutes) * time.Minute
+}
+
 // markOutboxRetryable transitions a single outbox item to the 'retryable' state
 // after a transient error, using exponential backoff based on the attempt count.
 func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bool) error {
-	backoff := time.Duration(1<<uint(attempts)) * time.Minute
-	if backoff > time.Hour {
-		backoff = time.Hour
-	}
-	if backoff < time.Minute {
-		backoff = time.Minute
-	}
+	backoff := computeOutboxBackoff(attempts)
 	if circuitOpen {
 		backoff = circuitBreakerResetTimeout
 	}

@@ -201,6 +201,29 @@ func TestProcessNextEventRollsBackWhenOutboxInsertFails(t *testing.T) {
 	}
 }
 
+func TestComputeOutboxBackoffExponentialAndCapped(t *testing.T) {
+	cases := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{0, time.Minute},
+		{1, 2 * time.Minute},
+		{2, 4 * time.Minute},
+		{3, 8 * time.Minute},
+		{4, 16 * time.Minute},
+		{5, 32 * time.Minute},
+		{6, 60 * time.Minute}, // capped at 1 hour
+		{7, 60 * time.Minute},
+		{100, 60 * time.Minute}, // very large attempts must not overflow
+	}
+	for _, tc := range cases {
+		got := computeOutboxBackoff(tc.attempts)
+		if got != tc.want {
+			t.Fatalf("computeOutboxBackoff(%d) = %v, want %v", tc.attempts, got, tc.want)
+		}
+	}
+}
+
 func TestClaimNoEventCommitsEmptyTransaction(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
