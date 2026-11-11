@@ -10,13 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/rs/zerolog/log"
+	"github.com/wneessen/go-mail"
 
+	"github.com/Pamawas/pamawas-correlator/config"
 	"github.com/Pamawas/pamawas-correlator/metrics"
 	"github.com/Pamawas/pamawas-correlator/models"
 )
@@ -195,12 +198,24 @@ type Correlator struct {
 	serviceToken    string
 	httpClient      *http.Client
 
+	// Notification channels for incident-resolved alerts (high/critical only)
+	discordWebhookURL  string
+	telegramBotToken   string
+	telegramChatID     string
+	telegramAPIBaseURL string
+	emailSMTPHost      string
+	emailSMTPPort      int
+	emailUsername      string
+	emailPassword      string
+	emailFrom          string
+	emailTo            string
+
 	circuitBreaker  *circuitBreaker
 	cycleTimeout    time.Duration
 	shutdownTimeout time.Duration
 }
 
-func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL, serviceToken string) *Correlator {
+func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL, serviceToken string, cfg config.Config) *Correlator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Correlator{
 		db:              db,
@@ -218,6 +233,16 @@ func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, 
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		discordWebhookURL:  cfg.DiscordWebhookURL,
+		telegramBotToken:   cfg.TelegramBotToken,
+		telegramChatID:     cfg.TelegramChatID,
+		telegramAPIBaseURL: cfg.TelegramAPIBaseURL,
+		emailSMTPHost:      cfg.EmailSMTPHost,
+		emailSMTPPort:      cfg.EmailSMTPPort,
+		emailUsername:      cfg.EmailUsername,
+		emailPassword:      cfg.EmailPassword,
+		emailFrom:          cfg.EmailFrom,
+		emailTo:            cfg.EmailTo,
 		circuitBreaker:  newCircuitBreaker(circuitBreakerThreshold, circuitBreakerResetTimeout),
 		cycleTimeout:    defaultCycleTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
@@ -340,7 +365,13 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 		return false, false, execErr
 	}
 	key := investigationRequestKey(incidentID, event.ID)
-	_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$5,$5) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now)
+	outboxReason := reason
+	if outboxReason == "resolution_of_open_incident" {
+		outboxReason = "incident_resolved"
+	} else {
+		outboxReason = "incident_created"
+	}
+	_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, outboxReason, now)
 	if execErr != nil {
 		return false, false, execErr
 	}
@@ -521,6 +552,7 @@ type outboxItem struct {
 	contractVersion int
 	requestKeyHash  string
 	attempts        int
+	reason          string // "incident_created" or "incident_resolved"
 }
 
 func (c *Correlator) processOutbox() error {
@@ -537,7 +569,7 @@ func (c *Correlator) processOutbox() error {
 		}
 
 		rows, err := tx.QueryContext(c.ctx, `
-			SELECT id, incident_id, contract_version, request_key_hash, attempts
+			SELECT id, incident_id, contract_version, request_key_hash, attempts, reason
 			FROM investigation_outbox
 			WHERE status = 'pending'
 			   OR (status = 'retryable' AND next_attempt_at <= now())
@@ -607,7 +639,7 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 	var items []outboxItem
 	for rows.Next() {
 		var item outboxItem
-		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash, &item.attempts); err != nil {
+		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash, &item.attempts, &item.reason); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -618,7 +650,14 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 // processOutboxItem leases a single outbox item (already leased by processOutbox),
 // calls the investigator API outside of any transaction, and applies the response
 // status to the outbox record in its own short transaction.
+// Items with reason "incident_resolved" (high/critical only) send an immediate
+// user-facing alert-solved notification via Discord/Telegram/Email instead of
+// calling the investigator.
 func (c *Correlator) processOutboxItem(item outboxItem) error {
+	if item.reason == "incident_resolved" {
+		return c.sendIncidentResolvedNotification(item.id, item.incidentID)
+	}
+
 	// If the circuit breaker is open, skip the HTTP call and retry later.
 	if !c.circuitBreaker.allow() {
 		return c.markOutboxRetryable(item.id, item.attempts, true)
@@ -663,6 +702,212 @@ func (c *Correlator) processOutboxItem(item outboxItem) error {
 	}()
 
 	return c.applyOutboxResponseStatusStandalone(item.id, resp)
+}
+
+// sendIncidentResolvedNotification fetches the incident and sends an immediate
+// "alert solved" notification via Discord/Telegram/Email for high/critical
+// severity alerts only. Low severity alerts produce no user-facing notification.
+func (c *Correlator) sendIncidentResolvedNotification(outboxID, incidentID string) error {
+	var (
+		title       string
+		severity    string
+		environment string
+		resolvedAt  time.Time
+		startedAt   time.Time
+	)
+	row := c.db.QueryRowContext(c.ctx, `SELECT title, severity, environment, resolved_at, started_at FROM incidents WHERE id = $1`, incidentID)
+	if err := row.Scan(&title, &severity, &environment, &resolvedAt, &startedAt); err != nil {
+		if err == sql.ErrNoRows {
+			log.Warn().Str("incident_id", incidentID).Msg("Incident not found for resolve notification, marking delivered")
+			return nil
+		}
+		return err
+	}
+
+	// High/critical only: skip low-level alerts.
+	if severity != "high" && severity != "critical" {
+		log.Info().Str("incident_id", incidentID).Str("severity", severity).Msg("Resolve notification skipped: not high/critical severity")
+		return nil
+	}
+
+	msg := formatResolveNotification(incidentID, title, severity, environment, resolvedAt, startedAt)
+
+	// Send via all configured channels (best effort; failures are logged, not retried
+	// here — the outbox item will be retried by the worker on the next cycle if marked retryable).
+	var firstErr error
+
+	if c.discordWebhookURL != "" {
+		if err := c.sendDiscord(c.ctx, msg); err != nil {
+			log.Error().Err(err).Str("incident_id", incidentID).Msg("Discord resolve notification failed")
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if c.telegramBotToken != "" && c.telegramChatID != "" {
+		if err := c.sendTelegram(c.ctx, msg); err != nil {
+			log.Error().Err(err).Str("incident_id", incidentID).Msg("Telegram resolve notification failed")
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if c.emailSMTPHost != "" && c.emailUsername != "" && c.emailPassword != "" {
+		if err := c.sendEmail(c.ctx, msg, title); err != nil {
+			log.Error().Err(err).Str("incident_id", incidentID).Msg("Email resolve notification failed")
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	// Mark the outbox item delivered even if some channels failed — this is a
+	// best-effort user notification, not a blocking downstream dependency.
+	if err := c.markOutboxDelivered(outboxID); err != nil {
+		return err
+	}
+	return firstErr
+}
+
+// markOutboxDelivered transitions an outbox item to 'delivered'.
+func (c *Correlator) markOutboxDelivered(id string) error {
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
+		}
+	}()
+	_, err = tx.ExecContext(c.ctx, `
+		UPDATE investigation_outbox
+		SET status = 'delivered', updated_at = now()
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		return err
+	}
+	rollback = false
+	return tx.Commit()
+}
+
+// sendDiscord sends an alert-resolved message via Discord webhook.
+func (c *Correlator) sendDiscord(ctx context.Context, content string) error {
+	payload := map[string]interface{}{
+		"content":  content,
+		"username": "Pamawas Alert",
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.discordWebhookURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close Discord response body")
+		}
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("discord webhook returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// sendTelegram sends an alert-resolved message via Telegram Bot API.
+func (c *Correlator) sendTelegram(ctx context.Context, content string) error {
+	telegramBase := c.telegramAPIBaseURL
+	if telegramBase == "" {
+		telegramBase = "https://api.telegram.org"
+	}
+	url := fmt.Sprintf("%s/bot%s/sendMessage", telegramBase, c.telegramBotToken)
+	payload := map[string]interface{}{
+		"chat_id": c.telegramChatID,
+		"text":    content,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close Telegram response body")
+		}
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram api returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// sendEmail sends an alert-resolved message via SMTP.
+func (c *Correlator) sendEmail(ctx context.Context, body, subject string) error {
+	if c.emailSMTPHost == "" || c.emailUsername == "" || c.emailPassword == "" {
+		return nil
+	}
+	client, err := mail.NewClient(c.emailSMTPHost,
+		mail.WithPort(c.emailSMTPPort),
+		mail.WithSMTPAuth(mail.SMTPAuthPlain),
+		mail.WithUsername(c.emailUsername),
+		mail.WithPassword(c.emailPassword),
+		mail.WithTLSPortPolicy(mail.TLSMandatory),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create SMTP client: %w", err)
+	}
+	msg := mail.NewMsg()
+	if err := msg.From(c.emailFrom); err != nil {
+		return fmt.Errorf("failed to set from address: %w", err)
+	}
+	if err := msg.To(c.emailTo); err != nil {
+		return fmt.Errorf("failed to set to address: %w", err)
+	}
+	msg.Subject(subject)
+	msg.SetBodyString(mail.TypeTextPlain, body)
+	emailCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := client.DialAndSendWithContext(emailCtx, msg); err != nil {
+		return fmt.Errorf("failed to send email: %w", err)
+	}
+	log.Info().Str("smtp_host", c.emailSMTPHost).Str("to", c.emailTo).Msg("Resolve notification email sent successfully")
+	return nil
+}
+
+// formatResolveNotification builds a human-readable alert-solved message.
+func formatResolveNotification(incidentID, title, severity, environment string, resolvedAt, startedAt time.Time) string {
+	var sb strings.Builder
+	sb.WriteString("✅ *Alert Resolved*\n")
+	sb.WriteString(fmt.Sprintf("Incident: %s (%s)\n", title, incidentID))
+	sb.WriteString(fmt.Sprintf("Severity: %s\n", severity))
+	sb.WriteString(fmt.Sprintf("Environment: %s\n", environment))
+	if !startedAt.IsZero() {
+		sb.WriteString(fmt.Sprintf("Started: %s\n", startedAt.UTC().Format(time.RFC3339)))
+	}
+	if !resolvedAt.IsZero() {
+		sb.WriteString(fmt.Sprintf("Resolved: %s\n", resolvedAt.UTC().Format(time.RFC3339)))
+	}
+	sb.WriteString("The alert has recovered and is no longer firing.")
+	return sb.String()
 }
 
 // leaseOutboxItem transitions a single outbox item to the 'leased' state.

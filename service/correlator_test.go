@@ -123,7 +123,7 @@ func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	requestKey := investigationRequestKey("inc_a", "evt_1")
 	mock.ExpectExec("INSERT INTO investigation_outbox").
-		WithArgs(outboxID(requestKey), "inc_a", 1, requestKey, base).
+		WithArgs(outboxID(requestKey), "inc_a", 1, requestKey, base, "incident_resolved", base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -159,7 +159,7 @@ func TestProcessNextEventCreatesIncidentAndOutbox(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	requestKey := investigationRequestKey("inc_new", "evt_2")
 	mock.ExpectExec("INSERT INTO investigation_outbox").
-		WithArgs(outboxID(requestKey), "inc_new", 1, requestKey, base).
+		WithArgs(outboxID(requestKey), "inc_new", 1, requestKey, base, "incident_created", base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 

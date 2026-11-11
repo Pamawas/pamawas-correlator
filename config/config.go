@@ -8,13 +8,23 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	Port        string
-	LogLevel    string
-	Environment string
-	TimeWindow  time.Duration
-	Interval    time.Duration
-	Mode        string
+	DatabaseURL        string
+	Port               string
+	LogLevel           string
+	Environment        string
+	TimeWindow         time.Duration
+	Interval           time.Duration
+	Mode               string
+	DiscordWebhookURL  string
+	TelegramBotToken   string
+	TelegramChatID     string
+	TelegramAPIBaseURL string
+	EmailSMTPHost      string
+	EmailSMTPPort      int
+	EmailUsername      string
+	EmailPassword      string
+	EmailFrom          string
+	EmailTo            string
 }
 
 func Load() Config {
@@ -48,8 +58,45 @@ func Load() Config {
 	if err := v.BindEnv("mode", "CORRELATOR_MODE", "PAMAWAS_CORRELATOR_MODE"); err != nil {
 		panic(fmt.Sprintf("failed to bind CORRELATOR_MODE env: %v", err))
 	}
+	if err := v.BindEnv("discord_webhook_url", "DISCORD_WEBHOOK_URL", "PAMAWAS_CORRELATOR_DISCORD_WEBHOOK_URL"); err != nil {
+		panic(fmt.Sprintf("failed to bind DISCORD_WEBHOOK_URL env: %v", err))
+	}
+	if err := v.BindEnv("telegram_bot_token", "TELEGRAM_BOT_TOKEN", "PAMAWAS_CORRELATOR_TELEGRAM_BOT_TOKEN"); err != nil {
+		panic(fmt.Sprintf("failed to bind TELEGRAM_BOT_TOKEN env: %v", err))
+	}
+	if err := v.BindEnv("telegram_chat_id", "TELEGRAM_CHAT_ID", "PAMAWAS_CORRELATOR_TELEGRAM_CHAT_ID"); err != nil {
+		panic(fmt.Sprintf("failed to bind TELEGRAM_CHAT_ID env: %v", err))
+	}
+	if err := v.BindEnv("telegram_api_base_url", "TELEGRAM_API_BASE_URL", "PAMAWAS_CORRELATOR_TELEGRAM_API_BASE_URL"); err != nil {
+		panic(fmt.Sprintf("failed to bind TELEGRAM_API_BASE_URL env: %v", err))
+	}
+	if err := v.BindEnv("email_smtp_host", "EMAIL_SMTP_HOST", "PAMAWAS_CORRELATOR_EMAIL_SMTP_HOST"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_SMTP_HOST env: %v", err))
+	}
+	if err := v.BindEnv("email_smtp_port", "EMAIL_SMTP_PORT", "PAMAWAS_CORRELATOR_EMAIL_SMTP_PORT"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_SMTP_PORT env: %v", err))
+	}
+	if err := v.BindEnv("email_username", "EMAIL_USERNAME", "PAMAWAS_CORRELATOR_EMAIL_USERNAME"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_USERNAME env: %v", err))
+	}
+	if err := v.BindEnv("email_password", "EMAIL_PASSWORD", "PAMAWAS_CORRELATOR_EMAIL_PASSWORD"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_PASSWORD env: %v", err))
+	}
+	if err := v.BindEnv("email_from", "EMAIL_FROM", "PAMAWAS_CORRELATOR_EMAIL_FROM"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_FROM env: %v", err))
+	}
+	if err := v.BindEnv("email_to", "EMAIL_TO", "PAMAWAS_CORRELATOR_EMAIL_TO"); err != nil {
+		panic(fmt.Sprintf("failed to bind EMAIL_TO env: %v", err))
+	}
 
 	// Defaults
+	v.SetDefault("port", "8080")
+	v.SetDefault("log_level", "info")
+	v.SetDefault("environment", "development")
+	v.SetDefault("time_window", "10m")
+	v.SetDefault("interval", "1m")
+	v.SetDefault("mode", "auto")
+	v.SetDefault("email_smtp_port", 587)
 	v.SetDefault("port", "8080")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("environment", "development")
@@ -73,13 +120,23 @@ func Load() Config {
 	}
 
 	cfg := Config{
-		DatabaseURL: v.GetString("database_url"),
-		Port:        v.GetString("port"),
-		LogLevel:    v.GetString("log_level"),
-		Environment: v.GetString("environment"),
-		TimeWindow:  timeWindow,
-		Interval:    interval,
-		Mode:        v.GetString("mode"),
+		DatabaseURL:        v.GetString("database_url"),
+		Port:               v.GetString("port"),
+		LogLevel:           v.GetString("log_level"),
+		Environment:        v.GetString("environment"),
+		TimeWindow:         timeWindow,
+		Interval:           interval,
+		Mode:               v.GetString("mode"),
+		DiscordWebhookURL:  v.GetString("discord_webhook_url"),
+		TelegramBotToken:   v.GetString("telegram_bot_token"),
+		TelegramChatID:     v.GetString("telegram_chat_id"),
+		TelegramAPIBaseURL: v.GetString("telegram_api_base_url"),
+		EmailSMTPHost:      v.GetString("email_smtp_host"),
+		EmailSMTPPort:      v.GetInt("email_smtp_port"),
+		EmailUsername:      v.GetString("email_username"),
+		EmailPassword:      v.GetString("email_password"),
+		EmailFrom:          v.GetString("email_from"),
+		EmailTo:            v.GetString("email_to"),
 	}
 
 	if cfg.DatabaseURL == "" {
