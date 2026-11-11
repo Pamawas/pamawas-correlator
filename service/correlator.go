@@ -576,12 +576,15 @@ func (c *Correlator) fetchAndLeaseOutboxItems(batchSize int) ([]outboxItem, erro
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-
-		items, err = scanOutboxRows(rows)
-		if err != nil {
-			return err
+		scanItems, scanErr := scanOutboxRows(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return scanErr
 		}
+		if closeErr != nil {
+			return closeErr
+		}
+		items = scanItems
 
 		if len(items) == 0 {
 			return nil
