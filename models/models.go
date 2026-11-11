@@ -33,14 +33,16 @@ type Incident struct {
 
 // HealthResponse represents the health check response
 type HealthResponse struct {
-	Status     string    `json:"status"`
-	Timestamp  time.Time `json:"timestamp"`
-	LastRun    time.Time `json:"last_run"`
-	Running    bool      `json:"running"`
-	TimeWindow string    `json:"time_window"`
-	Uptime     string    `json:"uptime,omitempty"`
-	Version    string    `json:"version,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Status              string    `json:"status"`
+	Timestamp           time.Time `json:"timestamp"`
+	LastRun             time.Time `json:"last_run"`
+	Running             bool      `json:"running"`
+	TimeWindow          string    `json:"time_window"`
+	Uptime              string    `json:"uptime,omitempty"`
+	Version             string    `json:"version,omitempty"`
+	Error               string    `json:"error,omitempty"`
+	CircuitBreakerState string    `json:"circuit_breaker_state,omitempty"`
+	Errors              []string  `json:"errors,omitempty"`
 }
 
 // StatusResponse represents the status response

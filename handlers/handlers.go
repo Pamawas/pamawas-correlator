@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,24 +20,25 @@ import (
 
 // Handler holds dependencies for HTTP handlers
 type Handler struct {
-	correlator *service.Correlator
-	cfg        config.Config
-	metrics    *metrics.Metrics
-	db         *sql.DB
+	correlator    *service.Correlator
+	cfg           config.Config
+	metrics       *metrics.Metrics
+	db            *sql.DB
+	investigatorURL string
 }
 
 // NewHandler creates a new handler with dependencies
-func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics) *Handler {
+func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics, investigatorURL string) *Handler {
 	// Get investigator URL from environment
-	investigatorURL := os.Getenv("INVESTIGATOR_URL")
 	serviceToken := os.Getenv("PAMAWAS_SERVICE_TOKEN")
 	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL, serviceToken)
 
 	return &Handler{
-		correlator: correlator,
-		cfg:        cfg,
-		metrics:    m,
-		db:         db,
+		correlator:    correlator,
+		cfg:           cfg,
+		metrics:       m,
+		db:            db,
+		investigatorURL: investigatorURL,
 	}
 }
 
@@ -48,35 +50,60 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	status := "healthy"
+	var errors []string
+
 	if err := h.db.PingContext(r.Context()); err != nil {
 		h.metrics.DBConnectionErrors.Inc()
 		log.Error().Err(err).Msg("Health check failed: database connection")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if encodeErr := json.NewEncoder(w).Encode(models.HealthResponse{
-			Status: "unhealthy",
-			Error:  fmt.Sprintf("Database connection failed: %v", err),
-		}); encodeErr != nil {
-			log.Error().Err(encodeErr).Msg("Failed to encode health response")
-		}
-		return
+		status = "unhealthy"
+		errors = append(errors, fmt.Sprintf("database: %v", err))
 	}
 
 	h.correlator.MuLock()
 	lastRun := h.correlator.LastRun()
 	running := h.correlator.Running()
+	circuitState := h.correlator.CircuitBreakerState()
 	h.correlator.MuUnlock()
+
+	if h.investigatorURL != "" {
+		if err := h.pingInvestigator(r.Context()); err != nil {
+			log.Error().Err(err).Msg("Health check failed: investigator unreachable")
+			status = "unhealthy"
+			errors = append(errors, fmt.Sprintf("investigator: %v", err))
+		}
+	}
 
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(models.HealthResponse{
-		Status:     "healthy",
-		Timestamp:  time.Now().UTC(),
-		LastRun:    lastRun,
-		Running:    running,
-		TimeWindow: h.cfg.TimeWindow.String(),
-		Version:    "1.0.0",
+		Status:             status,
+		Timestamp:          time.Now().UTC(),
+		LastRun:            lastRun,
+		Running:            running,
+		TimeWindow:         h.cfg.TimeWindow.String(),
+		Version:            "1.0.0",
+		CircuitBreakerState: circuitState,
+		Errors:             errors,
 	}); err != nil {
 		log.Error().Err(err).Msg("Failed to encode health response")
 	}
+}
+
+// pingInvestigator checks investigator connectivity with a short timeout.
+func (h *Handler) pingInvestigator(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", h.investigatorURL+"/api/v1/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("investigator returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // ReadyHandler handles readiness check requests

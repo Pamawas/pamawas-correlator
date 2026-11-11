@@ -37,7 +37,7 @@ func newTestHandler(t *testing.T) (*Handler, sqlmock.Sqlmock) {
 		Interval:   1 * time.Minute,
 		Mode:       "auto",
 	}
-	return NewHandler(db, cfg, testMetrics()), mock
+	return NewHandler(db, cfg, testMetrics(), ""), mock
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {

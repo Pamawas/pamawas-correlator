@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -23,7 +24,17 @@ import (
 const (
 	correlationPolicy  = "pamawas-correlation-v1"
 	correlationVersion = 1
+
+	maxEventsPerCycle     = 500
+	defaultCycleTimeout   = 2 * time.Minute
+	defaultShutdownTimeout = 15 * time.Second
+	circuitBreakerThreshold = 5
+	circuitBreakerResetTimeout = 30 * time.Second
+	outboxRetention       = 24 * time.Hour
+	outboxCleanupEveryTicks = 120 // 120 * 30s = 1 hour
 )
+
+var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
 
 type incidentCandidate struct {
 	ID            string
@@ -38,8 +49,6 @@ type incidentCandidate struct {
 	Severity      string
 	Labels        map[string]string
 }
-
-var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
 
 func selectCandidate(event models.Event, candidates []incidentCandidate) (incidentCandidate, int, bool) {
 	var selected incidentCandidate
@@ -116,6 +125,55 @@ func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) 
 		fingerprint != "" && fingerprint == candidate.Labels["grafana_fingerprint"]
 }
 
+// circuitBreaker tracks consecutive failures to the investigator and stops
+// sending requests when the downstream is unhealthy.
+type circuitBreaker struct {
+	mu            sync.Mutex
+	failures      int
+	lastFailure   time.Time
+	state         string // "closed", "open", "half-open"
+	threshold     int
+	resetTimeout  time.Duration
+}
+
+func newCircuitBreaker(threshold int, resetTimeout time.Duration) *circuitBreaker {
+	return &circuitBreaker{
+		state:       "closed",
+		threshold:   threshold,
+		resetTimeout: resetTimeout,
+	}
+}
+
+func (cb *circuitBreaker) allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.state == "open" {
+		if time.Since(cb.lastFailure) > cb.resetTimeout {
+			cb.state = "half-open"
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func (cb *circuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures = 0
+	cb.state = "closed"
+}
+
+func (cb *circuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
+	if cb.failures >= cb.threshold {
+		cb.state = "open"
+	}
+}
+
 type Correlator struct {
 	db            *sql.DB
 	timeWindow    time.Duration
@@ -136,6 +194,10 @@ type Correlator struct {
 	investigatorURL string
 	serviceToken    string
 	httpClient      *http.Client
+
+	circuitBreaker  *circuitBreaker
+	cycleTimeout    time.Duration
+	shutdownTimeout time.Duration
 }
 
 func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL, serviceToken string) *Correlator {
@@ -156,6 +218,9 @@ func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, 
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		circuitBreaker:  newCircuitBreaker(circuitBreakerThreshold, circuitBreakerResetTimeout),
+		cycleTimeout:    defaultCycleTimeout,
+		shutdownTimeout: defaultShutdownTimeout,
 	}
 }
 
@@ -164,6 +229,13 @@ func (c *Correlator) MuUnlock()            { c.mu.Unlock() }
 func (c *Correlator) LastRun() time.Time   { return c.lastRun }
 func (c *Correlator) Running() bool        { return c.running }
 func (c *Correlator) StartTime() time.Time { return c.startTime }
+
+// CircuitBreakerState returns the current circuit breaker state for observability.
+func (c *Correlator) CircuitBreakerState() string {
+	c.circuitBreaker.mu.Lock()
+	defer c.circuitBreaker.mu.Unlock()
+	return c.circuitBreaker.state
+}
 
 func (c *Correlator) Correlate() error {
 	c.mu.Lock()
@@ -186,11 +258,17 @@ func (c *Correlator) Correlate() error {
 	}()
 	c.wg.Add(1)
 	defer c.wg.Done()
+
+	// Each correlation cycle is bounded by a context timeout so a slow or hung
+	// database query cannot block the worker indefinitely.
+	cycleCtx, cancel := context.WithTimeout(c.ctx, c.cycleTimeout)
+	defer cancel()
+
 	start := c.now()
 	processed := 0
 	created := 0
-	for {
-		didProcess, didCreate, err := c.processNextEvent(c.ctx)
+	for processed < maxEventsPerCycle {
+		didProcess, didCreate, err := c.processNextEvent(cycleCtx)
 		if err != nil {
 			if c.metrics != nil {
 				c.metrics.CorrelationCyclesTotal.WithLabelValues("error").Inc()
@@ -286,6 +364,17 @@ func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	if err := json.Unmarshal(labels, &event.Labels); err != nil {
 		return event, err
 	}
+	// Validate the event before it is correlated. Malformed events are rejected
+	// early to prevent them from creating bad incidents or blocking the worker.
+	if event.ID == "" {
+		return event, errors.New("event has empty id")
+	}
+	if event.Environment == "" {
+		return event, errors.New("event has empty environment")
+	}
+	if event.Timestamp.IsZero() {
+		return event, errors.New("event has zero timestamp")
+	}
 	return event, nil
 }
 
@@ -377,25 +466,6 @@ func investigationRequestKey(incidentID, eventID string) string {
 }
 func outboxID(key string) string { return "irout_" + key[:26] }
 
-func (c *Correlator) StartOutboxWorker() {
-	if c.investigatorURL == "" {
-		log.Info().Msg("Investigator URL not configured, skipping outbox worker")
-		return
-	}
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			if err := c.processOutbox(); err != nil {
-				log.Error().Err(err).Msg("Outbox processing error")
-			}
-		}
-	}
-}
-
 func (c *Correlator) StartWorker() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -411,70 +481,113 @@ func (c *Correlator) StartWorker() {
 	}
 }
 
+func (c *Correlator) StartOutboxWorker() {
+	if c.investigatorURL == "" {
+		log.Info().Msg("Investigator URL not configured, skipping outbox worker")
+		return
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	cleanupTicker := time.NewTicker(outboxRetention)
+	defer cleanupTicker.Stop()
+	cleanupTickCount := 0
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.processOutbox(); err != nil {
+				log.Error().Err(err).Msg("Outbox processing error")
+			}
+			cleanupTickCount++
+			if cleanupTickCount >= outboxCleanupEveryTicks {
+				if err := c.cleanupDeliveredOutbox(); err != nil {
+					log.Error().Err(err).Msg("Outbox cleanup error")
+				}
+				cleanupTickCount = 0
+			}
+		case <-cleanupTicker.C:
+			if err := c.cleanupDeliveredOutbox(); err != nil {
+				log.Error().Err(err).Msg("Outbox cleanup error")
+			}
+		}
+	}
+}
+
 // outboxItem represents a single pending entry in the investigation_outbox table.
 type outboxItem struct {
 	id              string
 	incidentID      string
 	contractVersion int
 	requestKeyHash  string
+	attempts        int
 }
 
 func (c *Correlator) processOutbox() error {
 	const batchSize = 10
-	tx, err := c.db.BeginTx(c.ctx, nil)
-	if err != nil {
-		return err
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+	const maxBatchesPerRun = 5
+
+	batches := 0
+	for {
+		if batches >= maxBatchesPerRun {
+			break
+		}
+		batches++
+
+		tx, err := c.db.BeginTx(c.ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		rows, err := tx.QueryContext(c.ctx, `
+			SELECT id, incident_id, contract_version, request_key_hash, attempts
+			FROM investigation_outbox
+			WHERE status = 'pending'
+			   OR (status = 'retryable' AND next_attempt_at <= now())
+			   OR (status = 'leased' AND lease_expires_at <= now())
+			ORDER BY created_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, batchSize)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		items, err := scanOutboxRows(rows)
+		rows.Close()
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		if len(items) == 0 {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		// Lease all items in this transaction, then commit promptly so row locks
+		// are not held during the downstream HTTP call.
+		for _, item := range items {
+			if err := c.leaseOutboxItem(tx, item); err != nil {
+				tx.Rollback()
+				return err
 			}
 		}
-	}()
-
-	rows, err := tx.QueryContext(c.ctx, `
-		SELECT id, incident_id, contract_version, request_key_hash
-		FROM investigation_outbox
-		WHERE status = 'pending'
-		   OR (status = 'retryable' AND next_attempt_at <= now())
-		   OR (status = 'leased' AND lease_expires_at <= now())
-		ORDER BY created_at
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`, batchSize)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close rows")
-		}
-	}()
-
-	items, err := scanOutboxRows(rows)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		rollback = false
-		return nil
-	}
 
-	for _, item := range items {
-		if err := c.processOutboxItem(tx, item); err != nil {
-			return err
+		// Process each item outside the transaction. A single slow or failed
+		// investigator call must not block the rest of the batch.
+		for _, item := range items {
+			if err := c.processOutboxItem(item); err != nil {
+				log.Error().Err(err).Str("outbox_id", item.id).Str("incident_id", item.incidentID).Msg("Outbox item processing failed")
+			}
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	rollback = false
 	return nil
 }
 
@@ -483,7 +596,7 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 	var items []outboxItem
 	for rows.Next() {
 		var item outboxItem
-		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash); err != nil {
+		if err := rows.Scan(&item.id, &item.incidentID, &item.contractVersion, &item.requestKeyHash, &item.attempts); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -491,11 +604,13 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 	return items, rows.Err()
 }
 
-// processOutboxItem leases a single outbox item, calls the investigator API,
-// and applies the response status to the outbox record.
-func (c *Correlator) processOutboxItem(tx *sql.Tx, item outboxItem) error {
-	if err := c.leaseOutboxItem(tx, item); err != nil {
-		return err
+// processOutboxItem leases a single outbox item (already leased by processOutbox),
+// calls the investigator API outside of any transaction, and applies the response
+// status to the outbox record in its own short transaction.
+func (c *Correlator) processOutboxItem(item outboxItem) error {
+	// If the circuit breaker is open, skip the HTTP call and retry later.
+	if !c.circuitBreaker.allow() {
+		return c.markOutboxRetryable(item.id, item.attempts, true)
 	}
 
 	reqBody := map[string]interface{}{
@@ -520,71 +635,156 @@ func (c *Correlator) processOutboxItem(tx *sql.Tx, item outboxItem) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return c.markOutboxRetryable(tx, item.id)
+		c.circuitBreaker.recordFailure()
+		return c.markOutboxRetryable(item.id, item.attempts, false)
 	}
-
-	if err := c.applyOutboxResponseStatus(tx, item.id, resp); err != nil {
-		return err
-	}
-
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			log.Error().Err(closeErr).Msg("Failed to close response body")
 		}
 	}()
-	return nil
+
+	deliveryStart := time.Now()
+	defer func() {
+		if c.metrics != nil {
+			c.metrics.OutboxDeliveryDuration.Observe(time.Since(deliveryStart).Seconds())
+		}
+	}()
+
+	return c.applyOutboxResponseStatusStandalone(item.id, resp)
 }
 
 // leaseOutboxItem transitions a single outbox item to the 'leased' state.
 func (c *Correlator) leaseOutboxItem(tx *sql.Tx, item outboxItem) error {
 	_, err := tx.ExecContext(c.ctx, `
 		UPDATE investigation_outbox
-		SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1
+		SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1, updated_at = now()
 		WHERE id = $1
 	`, item.id)
 	return err
 }
 
 // markOutboxRetryable transitions a single outbox item to the 'retryable' state
-// after a transient error (e.g. HTTP transport failure).
-func (c *Correlator) markOutboxRetryable(tx *sql.Tx, id string) error {
-	_, err := tx.ExecContext(c.ctx, `
+// after a transient error, using exponential backoff based on the attempt count.
+func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bool) error {
+	backoff := time.Duration(1<<uint(attempts)) * time.Minute
+	if backoff > time.Hour {
+		backoff = time.Hour
+	}
+	if backoff < time.Minute {
+		backoff = time.Minute
+	}
+	if circuitOpen {
+		backoff = circuitBreakerResetTimeout
+	}
+
+	if c.metrics != nil {
+		c.metrics.OutboxRetryableTotal.Inc()
+	}
+
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(c.ctx, `
 		UPDATE investigation_outbox
-		SET status = 'retryable', next_attempt_at = now() + interval '1 minute'
-		WHERE id = $1
-	`, id)
-	return err
+		SET status = 'retryable', next_attempt_at = now() + $1, updated_at = now()
+		WHERE id = $2
+	`, backoff, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// applyOutboxResponseStatus maps an investigator HTTP response status code to the
-// corresponding outbox status update.
-func (c *Correlator) applyOutboxResponseStatus(tx *sql.Tx, itemID string, resp *http.Response) error {
+// applyOutboxResponseStatusStandalone maps an investigator HTTP response status
+// code to the corresponding outbox status update, managed in its own transaction.
+func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *http.Response) error {
+	var status string
+	var safeErrorCode string
+	recordFailure := false
+
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return c.updateOutboxStatus(tx, itemID, "delivered", "")
+		status = "delivered"
+		c.circuitBreaker.recordSuccess()
+		if c.metrics != nil {
+			c.metrics.OutboxDeliveredTotal.WithLabelValues("success").Inc()
+		}
 	case resp.StatusCode == 409:
-		return c.updateOutboxStatus(tx, itemID, "delivered", "")
+		status = "delivered"
+		safeErrorCode = "'INVESTIGATOR_CONFLICT'"
+		c.circuitBreaker.recordSuccess()
+		if c.metrics != nil {
+			c.metrics.OutboxDeliveredTotal.WithLabelValues("conflict").Inc()
+		}
 	case resp.StatusCode >= 500:
-		return c.updateOutboxStatus(tx, itemID, "retryable", "")
+		status = "retryable"
+		recordFailure = true
+		if c.metrics != nil {
+			c.metrics.OutboxFailedTotal.WithLabelValues("server_error").Inc()
+		}
 	default:
-		return c.updateOutboxStatus(tx, itemID, "failed_terminal", "'INVESTIGATOR_ERROR'")
+		status = "failed_terminal"
+		safeErrorCode = "'INVESTIGATOR_ERROR'"
+		if c.metrics != nil {
+			c.metrics.OutboxFailedTotal.WithLabelValues("client_error").Inc()
+		}
 	}
-}
 
-// updateOutboxStatus runs the UPDATE that transitions an outbox item to the
-// given status, optionally setting safe_error_code.
-func (c *Correlator) updateOutboxStatus(tx *sql.Tx, id, status, safeErrorCode string) error {
+	if recordFailure {
+		c.circuitBreaker.recordFailure()
+	}
+
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	query := `UPDATE investigation_outbox SET status = $1, updated_at = now() WHERE id = $2`
-	args := []interface{}{status, id}
+	args := []interface{}{status, itemID}
 	if safeErrorCode != "" {
 		query = `UPDATE investigation_outbox SET status = $1, safe_error_code = $2, updated_at = now() WHERE id = $3`
-		args = []interface{}{status, safeErrorCode, id}
+		args = []interface{}{status, safeErrorCode, itemID}
 	}
-	_, err := tx.ExecContext(c.ctx, query, args...)
-	return err
+	_, err = tx.ExecContext(c.ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (c *Correlator) Stop() {
+func (c *Correlator) Stop() error {
 	c.cancelFunc()
-	c.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(c.shutdownTimeout):
+		return errors.New("correlator shutdown timed out waiting for in-flight correlation cycle")
+	}
+}
+
+// cleanupDeliveredOutbox removes delivered outbox items older than the retention
+// window to prevent unbounded table growth.
+func (c *Correlator) cleanupDeliveredOutbox() error {
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(c.ctx, `
+		DELETE FROM investigation_outbox
+		WHERE status = 'delivered' AND updated_at < now() - $1
+	`, outboxRetention)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }

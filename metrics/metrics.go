@@ -14,6 +14,13 @@ type Metrics struct {
 	DBConnectionErrors     prometheus.Counter
 	LastRunTimestamp       prometheus.Gauge
 	CorrelatorRunning      prometheus.Gauge
+
+	// Outbox metrics
+	OutboxDeliveredTotal   *prometheus.CounterVec
+	OutboxFailedTotal      *prometheus.CounterVec
+	OutboxRetryableTotal   prometheus.Counter
+	OutboxPendingGauge     prometheus.Gauge
+	OutboxDeliveryDuration prometheus.Histogram
 }
 
 // NewMetrics creates and registers all metrics
@@ -61,6 +68,41 @@ func NewMetrics() *Metrics {
 			prometheus.GaugeOpts{
 				Name: "correlator_running",
 				Help: "Whether correlator is currently running (1) or not (0)",
+			},
+		),
+
+		// Outbox metrics
+		OutboxDeliveredTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "correlator_outbox_delivered_total",
+				Help: "Total number of outbox items delivered successfully",
+			},
+			[]string{"status"},
+		),
+		OutboxFailedTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "correlator_outbox_failed_total",
+				Help: "Total number of outbox items that failed",
+			},
+			[]string{"status"},
+		),
+		OutboxRetryableTotal: promauto.NewCounter(
+			prometheus.CounterOpts{
+				Name: "correlator_outbox_retryable_total",
+				Help: "Total number of outbox items marked retryable",
+			},
+		),
+		OutboxPendingGauge: promauto.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "correlator_outbox_pending",
+				Help: "Number of pending outbox items",
+			},
+		),
+		OutboxDeliveryDuration: promauto.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "correlator_outbox_delivery_duration_seconds",
+				Help:    "Duration of outbox delivery calls to investigator",
+				Buckets: prometheus.DefBuckets,
 			},
 		),
 	}

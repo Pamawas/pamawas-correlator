@@ -64,6 +64,13 @@ func main() {
 		}
 	}()
 
+	// Tune the connection pool so the correlator cannot exhaust Postgres connections
+	// under load or during bursty outbox processing.
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -90,7 +97,7 @@ func main() {
 	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL, serviceToken)
 
 	// Initialize handlers
-	h := handlers.NewHandler(db, cfg, m)
+	h := handlers.NewHandler(db, cfg, m, investigatorURL)
 
 	// Start background worker if not in manual mode
 	if cfg.Mode != "manual" {
@@ -131,7 +138,9 @@ func main() {
 		<-sigCh
 
 		log.Info().Msg("Shutdown signal received, stopping server...")
-		correlator.Stop()
+		if err := correlator.Stop(); err != nil {
+			log.Error().Err(err).Msg("Correlator stop error")
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
