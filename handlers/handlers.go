@@ -91,7 +91,7 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 // pingInvestigator checks investigator connectivity with a short timeout.
 func (h *Handler) pingInvestigator(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", h.investigatorURL+"/api/v1/health", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", h.investigatorURL+"/healthz", nil)
 	if err != nil {
 		return err
 	}
