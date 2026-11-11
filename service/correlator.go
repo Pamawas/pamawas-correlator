@@ -538,64 +538,12 @@ func (c *Correlator) processOutbox() error {
 	for batches < maxBatchesPerRun {
 		batches++
 
-		tx, err := c.db.BeginTx(c.ctx, nil)
+		items, err := c.fetchAndLeaseOutboxItems(batchSize)
 		if err != nil {
 			return err
 		}
-
-		rows, err := tx.QueryContext(c.ctx, `
-			SELECT id, incident_id, contract_version, request_key_hash, attempts, reason
-			FROM investigation_outbox
-			WHERE status = 'pending'
-			   OR (status = 'retryable' AND next_attempt_at <= now())
-			   OR (status = 'leased' AND lease_expires_at <= now())
-			ORDER BY created_at
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED
-		`, batchSize)
-		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				log.Error().Err(rbErr).Msg("failed to rollback transaction after query error")
-			}
-			return err
-		}
-
-		items, err := scanOutboxRows(rows)
-		if closeErr := rows.Close(); closeErr != nil {
-			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				log.Error().Err(rbErr).Msg("failed to rollback transaction after rows close error")
-			}
-			if err != nil {
-				return err
-			}
-			return closeErr
-		}
-		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				log.Error().Err(rbErr).Msg("failed to rollback transaction after scan error")
-			}
-			return err
-		}
-
 		if len(items) == 0 {
-			if err := tx.Commit(); err != nil {
-				return err
-			}
 			return nil
-		}
-
-		// Lease all items in this transaction, then commit promptly so row locks
-		// are not held during the downstream HTTP call.
-		for _, item := range items {
-			if err := c.leaseOutboxItem(tx, item); err != nil {
-				if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-					log.Error().Err(rbErr).Msg("failed to rollback transaction after lease error")
-				}
-				return err
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return err
 		}
 
 		// Process each item outside the transaction. A single slow or failed
@@ -607,6 +555,69 @@ func (c *Correlator) processOutbox() error {
 		}
 	}
 	return nil
+}
+
+// fetchAndLeaseOutboxItems queries pending outbox items and leases them in a
+// single transaction so row locks are released promptly after commit.
+func (c *Correlator) fetchAndLeaseOutboxItems(batchSize int) ([]outboxItem, error) {
+	var items []outboxItem
+
+	err := c.inTx(c.ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(c.ctx, `
+			SELECT id, incident_id, contract_version, request_key_hash, attempts, reason
+			FROM investigation_outbox
+			WHERE status = 'pending'
+			   OR (status = 'retryable' AND next_attempt_at <= now())
+			   OR (status = 'leased' AND lease_expires_at <= now())
+			ORDER BY created_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, batchSize)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		items, err = scanOutboxRows(rows)
+		if err != nil {
+			return err
+		}
+
+		if len(items) == 0 {
+			return nil
+		}
+
+		for _, item := range items {
+			if err := c.leaseOutboxItem(tx, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return items, err
+}
+
+// inTx executes fn within a transaction, committing on success and rolling back
+// on error. All rollback failures are logged but do not mask the original error.
+func (c *Correlator) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("failed to rollback transaction")
+			}
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	rollback = false
+	return tx.Commit()
 }
 
 // scanOutboxRows reads all pending outbox items from the rows iterator.
