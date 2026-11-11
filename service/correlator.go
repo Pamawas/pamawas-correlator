@@ -528,10 +528,7 @@ func (c *Correlator) processOutbox() error {
 	const maxBatchesPerRun = 5
 
 	batches := 0
-	for {
-		if batches >= maxBatchesPerRun {
-			break
-		}
+	for batches < maxBatchesPerRun {
 		batches++
 
 		tx, err := c.db.BeginTx(c.ctx, nil)
@@ -550,14 +547,26 @@ func (c *Correlator) processOutbox() error {
 			FOR UPDATE SKIP LOCKED
 		`, batchSize)
 		if err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("failed to rollback transaction after query error")
+			}
 			return err
 		}
 
 		items, err := scanOutboxRows(rows)
-		rows.Close()
+		if closeErr := rows.Close(); closeErr != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("failed to rollback transaction after rows close error")
+			}
+			if err != nil {
+				return err
+			}
+			return closeErr
+		}
 		if err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("failed to rollback transaction after scan error")
+			}
 			return err
 		}
 
@@ -572,7 +581,9 @@ func (c *Correlator) processOutbox() error {
 		// are not held during the downstream HTTP call.
 		for _, item := range items {
 			if err := c.leaseOutboxItem(tx, item); err != nil {
-				tx.Rollback()
+				if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+					log.Error().Err(rbErr).Msg("failed to rollback transaction after lease error")
+				}
 				return err
 			}
 		}
@@ -686,7 +697,14 @@ func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bo
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
+		}
+	}()
 	_, err = tx.ExecContext(c.ctx, `
 		UPDATE investigation_outbox
 		SET status = 'retryable', next_attempt_at = now() + $1, updated_at = now()
@@ -695,6 +713,7 @@ func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bo
 	if err != nil {
 		return err
 	}
+	rollback = false
 	return tx.Commit()
 }
 
@@ -741,7 +760,14 @@ func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *ht
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
+		}
+	}()
 
 	query := `UPDATE investigation_outbox SET status = $1, updated_at = now() WHERE id = $2`
 	args := []interface{}{status, itemID}
@@ -753,6 +779,7 @@ func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *ht
 	if err != nil {
 		return err
 	}
+	rollback = false
 	return tx.Commit()
 }
 
@@ -778,7 +805,14 @@ func (c *Correlator) cleanupDeliveredOutbox() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
+		}
+	}()
 	_, err = tx.ExecContext(c.ctx, `
 		DELETE FROM investigation_outbox
 		WHERE status = 'delivered' AND updated_at < now() - $1
@@ -786,5 +820,6 @@ func (c *Correlator) cleanupDeliveredOutbox() error {
 	if err != nil {
 		return err
 	}
+	rollback = false
 	return tx.Commit()
 }

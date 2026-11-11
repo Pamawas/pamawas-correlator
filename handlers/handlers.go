@@ -99,7 +99,11 @@ func (h *Handler) pingInvestigator(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close response body")
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("investigator returned status %d", resp.StatusCode)
 	}
