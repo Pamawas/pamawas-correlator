@@ -67,9 +67,12 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	h.correlator.MuUnlock()
 
 	if h.investigatorURL != "" {
-		if err := h.pingInvestigator(r.Context()); err != nil {
-			log.Error().Err(err).Msg("Health check failed: investigator unreachable")
-			status = "unhealthy"
+		if err := h.pingInvestigator(); err != nil {
+			// Investigator is a separate service with its own k8s probe.
+			// The correlator can still correlate events; the outbox worker
+			// handles delivery retries via its circuit breaker. Log a warning
+			// but don't mark the correlator itself unhealthy.
+			log.Warn().Err(err).Msg("Investigator unreachable; correlator health degraded")
 			errors = append(errors, fmt.Sprintf("investigator: %v", err))
 		}
 	}
@@ -90,7 +93,12 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // pingInvestigator checks investigator connectivity with a short timeout.
-func (h *Handler) pingInvestigator(ctx context.Context) error {
+// Uses its own context (not the request's) so a slow investigator cannot
+// cause cascading timeouts on the correlator's own health probe.
+func (h *Handler) pingInvestigator() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, "GET", h.investigatorURL+"/healthz", nil)
 	if err != nil {
 		return err
