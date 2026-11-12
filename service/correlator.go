@@ -125,8 +125,7 @@ func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) 
 		fingerprint != "" && fingerprint == candidate.Labels["grafana_fingerprint"]
 }
 
-// circuitBreaker tracks consecutive failures to the investigator and stops
-// sending requests when the downstream is unhealthy.
+// circuitBreaker tracks consecutive failures to the investigator and stops sending requests when unhealthy.
 type circuitBreaker struct {
 	mu            sync.Mutex
 	failures      int
@@ -259,8 +258,7 @@ func (c *Correlator) Correlate() error {
 	c.wg.Add(1)
 	defer c.wg.Done()
 
-	// Each correlation cycle is bounded by a context timeout so a slow or hung
-	// database query cannot block the worker indefinitely.
+// Each correlation cycle is bounded by a context timeout.
 	cycleCtx, cancel := context.WithTimeout(c.ctx, c.cycleTimeout)
 	defer cancel()
 
@@ -370,8 +368,7 @@ func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	if err := json.Unmarshal(labels, &event.Labels); err != nil {
 		return event, err
 	}
-	// Validate the event before it is correlated. Malformed events are rejected
-	// early to prevent them from creating bad incidents or blocking the worker.
+	// Validate the event before it is correlated.
 	if event.ID == "" {
 		return event, errors.New("event has empty id")
 	}
