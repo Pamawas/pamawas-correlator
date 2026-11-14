@@ -684,10 +684,26 @@ func (c *Correlator) processOutboxItem(item outboxItem) error {
 }
 
 // leaseOutboxItem transitions a single outbox item to the 'leased' state.
+//
+// A row that was already 'leased' with an expired lease (lease_expires_at <=
+// now()) is a stale claim: the worker that took it died or hung before it could
+// finish. Re-claiming it must not inflate the attempt counter, otherwise a
+// single stuck row would burn through the retry budget and reach
+// failed_terminal prematurely. Such rows are reset to a fresh attempt.
 func (c *Correlator) leaseOutboxItem(tx *sql.Tx, item outboxItem) error {
 	_, err := tx.ExecContext(c.ctx, `
 		UPDATE investigation_outbox
-		SET status = 'leased', lease_expires_at = now() + interval '5 minutes', attempts = attempts + 1, updated_at = now()
+		SET status = 'leased',
+		    lease_expires_at = now() + interval '5 minutes',
+		    attempts = CASE
+			WHEN status = 'leased' AND lease_expires_at <= now() THEN 0
+			ELSE attempts + 1
+		    END,
+		    next_attempt_at = CASE
+			WHEN status = 'leased' AND lease_expires_at <= now() THEN now()
+			ELSE next_attempt_at
+		    END,
+		    updated_at = now()
 		WHERE id = $1
 	`, item.id)
 	return err
@@ -715,12 +731,36 @@ func computeOutboxBackoff(attempts int) time.Duration {
 	return time.Duration(backoffMinutes) * time.Minute
 }
 
+// backoffMinutes returns the retry backoff in whole minutes for a given attempt
+// count. It is the integer form of computeOutboxBackoff, used to build a
+// Postgres interval in markOutboxRetryable. Returning minutes (not a Go
+// time.Duration) avoids the lib/pq bigint/seconds bug where a time.Duration
+// bound into `now() + $1` is interpreted by Postgres as seconds, pushing
+// next_attempt_at centuries into the future and disabling retries entirely.
+func backoffMinutes(attempts int) int64 {
+	return int64(computeOutboxBackoff(attempts).Minutes())
+}
+
 // markOutboxRetryable transitions a single outbox item to the 'retryable' state
 // after a transient error, using exponential backoff based on the attempt count.
+//
+// The backoff is written as an explicit Postgres interval ($1 * interval
+// '1 minute') so the unit is unambiguous regardless of how the driver encodes
+// the bind parameter. Previously the bind was a Go time.Duration (nanoseconds),
+// which lib/pq sent as a bigint; Postgres then evaluated `timestamptz + bigint`
+// as seconds, landing next_attempt_at in the year 3928 and permanently
+// disabling retries for those rows.
 func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bool) error {
-	backoff := computeOutboxBackoff(attempts)
+	var backoff int64
 	if circuitOpen {
-		backoff = circuitBreakerResetTimeout
+		// Circuit breaker reset timeout is 30s; express as 1 minute minimum so
+		// the interval arithmetic stays correct and the row is retried promptly.
+		backoff = 1
+	} else {
+		backoff = backoffMinutes(attempts)
+	}
+	if backoff < 1 {
+		backoff = 1
 	}
 
 	if c.metrics != nil {
@@ -741,7 +781,7 @@ func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bo
 	}()
 	_, err = tx.ExecContext(c.ctx, `
 		UPDATE investigation_outbox
-		SET status = 'retryable', next_attempt_at = now() + $1, updated_at = now()
+		SET status = 'retryable', next_attempt_at = now() + ($1 * interval '1 minute'), updated_at = now()
 		WHERE id = $2
 	`, backoff, id)
 	if err != nil {
