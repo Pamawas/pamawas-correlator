@@ -121,10 +121,6 @@ func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
 	mock.ExpectExec("INSERT INTO incident_events").
 		WithArgs("inc_a", "evt_1", "resolution_of_open_incident", 1, base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	requestKey := investigationRequestKey("inc_a", "evt_1")
-	mock.ExpectExec("INSERT INTO investigation_outbox").
-		WithArgs(outboxID(requestKey), "inc_a", 1, requestKey, base, "incident_resolved", base).
-		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	c := &Correlator{db: db, now: func() time.Time { return base }, newIncidentID: func(time.Time) string { return "inc_new" }}

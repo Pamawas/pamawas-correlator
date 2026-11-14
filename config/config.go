@@ -15,6 +15,11 @@ type Config struct {
 	TimeWindow  time.Duration
 	Interval    time.Duration
 	Mode        string
+
+	// Centralized circuit-breaker + retry-budget configuration (design review P2).
+	CircuitBreakerThreshold    int
+	CircuitBreakerResetTimeout time.Duration
+	OutboxMaxAttempts          int
 }
 
 func Load() Config {
@@ -48,6 +53,15 @@ func Load() Config {
 	if err := v.BindEnv("mode", "CORRELATOR_MODE", "PAMAWAS_CORRELATOR_MODE"); err != nil {
 		panic(fmt.Sprintf("failed to bind CORRELATOR_MODE env: %v", err))
 	}
+	if err := v.BindEnv("circuit_breaker_threshold", "CIRCUIT_BREAKER_THRESHOLD"); err != nil {
+		panic(fmt.Sprintf("failed to bind CIRCUIT_BREAKER_THRESHOLD env: %v", err))
+	}
+	if err := v.BindEnv("circuit_breaker_reset_timeout", "CIRCUIT_BREAKER_RESET_TIMEOUT"); err != nil {
+		panic(fmt.Sprintf("failed to bind CIRCUIT_BREAKER_RESET_TIMEOUT env: %v", err))
+	}
+	if err := v.BindEnv("outbox_max_attempts", "OUTBOX_MAX_ATTEMPTS"); err != nil {
+		panic(fmt.Sprintf("failed to bind OUTBOX_MAX_ATTEMPTS env: %v", err))
+	}
 
 	// Defaults
 	v.SetDefault("port", "8080")
@@ -56,6 +70,9 @@ func Load() Config {
 	v.SetDefault("time_window", "10m")
 	v.SetDefault("interval", "1m")
 	v.SetDefault("mode", "auto")
+	v.SetDefault("circuit_breaker_threshold", 5)
+	v.SetDefault("circuit_breaker_reset_timeout", "30s")
+	v.SetDefault("outbox_max_attempts", 5)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -71,15 +88,22 @@ func Load() Config {
 	if err != nil {
 		panic(fmt.Sprintf("invalid interval: %v", err))
 	}
+	cbResetTimeout, err := time.ParseDuration(v.GetString("circuit_breaker_reset_timeout"))
+	if err != nil {
+		panic(fmt.Sprintf("invalid circuit_breaker_reset_timeout: %v", err))
+	}
 
 	cfg := Config{
-		DatabaseURL: v.GetString("database_url"),
-		Port:        v.GetString("port"),
-		LogLevel:    v.GetString("log_level"),
-		Environment: v.GetString("environment"),
-		TimeWindow:  timeWindow,
-		Interval:    interval,
-		Mode:        v.GetString("mode"),
+		DatabaseURL:                v.GetString("database_url"),
+		Port:                       v.GetString("port"),
+		LogLevel:                   v.GetString("log_level"),
+		Environment:                v.GetString("environment"),
+		TimeWindow:                 timeWindow,
+		Interval:                   interval,
+		Mode:                       v.GetString("mode"),
+		CircuitBreakerThreshold:    v.GetInt("circuit_breaker_threshold"),
+		CircuitBreakerResetTimeout: cbResetTimeout,
+		OutboxMaxAttempts:          v.GetInt("outbox_max_attempts"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -100,6 +124,15 @@ func (c Config) Validate() error {
 	}
 	if c.Interval <= 0 {
 		return fmt.Errorf("interval must be positive")
+	}
+	if c.CircuitBreakerThreshold < 1 {
+		return fmt.Errorf("circuit_breaker_threshold must be >= 1")
+	}
+	if c.CircuitBreakerResetTimeout <= 0 {
+		return fmt.Errorf("circuit_breaker_reset_timeout must be positive")
+	}
+	if c.OutboxMaxAttempts < 1 {
+		return fmt.Errorf("outbox_max_attempts must be >= 1")
 	}
 	return nil
 }

@@ -25,13 +25,13 @@ const (
 	correlationPolicy  = "pamawas-correlation-v1"
 	correlationVersion = 1
 
-	maxEventsPerCycle     = 500
-	defaultCycleTimeout   = 2 * time.Minute
-	defaultShutdownTimeout = 15 * time.Second
-	circuitBreakerThreshold = 5
+	maxEventsPerCycle          = 500
+	defaultCycleTimeout        = 2 * time.Minute
+	defaultShutdownTimeout     = 15 * time.Second
+	circuitBreakerThreshold    = 5
 	circuitBreakerResetTimeout = 30 * time.Second
-	outboxRetention       = 24 * time.Hour
-	outboxCleanupEveryTicks = 120 // 120 * 30s = 1 hour
+	outboxRetention            = 24 * time.Hour
+	outboxCleanupEveryTicks    = 120 // 120 * 30s = 1 hour
 )
 
 var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
@@ -127,18 +127,18 @@ func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) 
 
 // circuitBreaker tracks consecutive failures to the investigator and stops sending requests when unhealthy.
 type circuitBreaker struct {
-	mu            sync.Mutex
-	failures      int
-	lastFailure   time.Time
-	state         string // "closed", "open", "half-open"
-	threshold     int
-	resetTimeout  time.Duration
+	mu           sync.Mutex
+	failures     int
+	lastFailure  time.Time
+	state        string // "closed", "open", "half-open"
+	threshold    int
+	resetTimeout time.Duration
 }
 
 func newCircuitBreaker(threshold int, resetTimeout time.Duration) *circuitBreaker {
 	return &circuitBreaker{
-		state:       "closed",
-		threshold:   threshold,
+		state:        "closed",
+		threshold:    threshold,
 		resetTimeout: resetTimeout,
 	}
 }
@@ -258,7 +258,7 @@ func (c *Correlator) Correlate() error {
 	c.wg.Add(1)
 	defer c.wg.Done()
 
-// Each correlation cycle is bounded by a context timeout.
+	// Each correlation cycle is bounded by a context timeout.
 	cycleCtx, cancel := context.WithTimeout(c.ctx, c.cycleTimeout)
 	defer cancel()
 
@@ -337,16 +337,14 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	if execErr != nil {
 		return false, false, execErr
 	}
-	key := investigationRequestKey(incidentID, event.ID)
-	outboxReason := reason
-	if outboxReason == "resolution_of_open_incident" {
-		outboxReason = "incident_resolved"
-	} else {
-		outboxReason = "incident_created"
-	}
-	_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, outboxReason, now)
-	if execErr != nil {
-		return false, false, execErr
+	// Only create an investigation outbox for incident_created, not for resolution.
+	// A resolved incident does not need investigation.
+	if reason != "resolution_of_open_incident" {
+		key := investigationRequestKey(incidentID, event.ID)
+		_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, reason, now)
+		if execErr != nil {
+			return false, false, execErr
+		}
 	}
 	commitErr := tx.Commit()
 	if commitErr != nil {
