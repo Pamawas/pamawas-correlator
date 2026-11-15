@@ -113,8 +113,8 @@ func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
 	mock.ExpectQuery("(?s)SELECT i.id.*FOR UPDATE OF i SKIP LOCKED").
 		WithArgs("prod", base.Add(-15*time.Minute), base.Add(5*time.Minute), base.Add(-6*time.Hour)).
 		WillReturnRows(sqlmock.NewRows(candidateColumns()).
-			AddRow("inc_b", "open", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-2*time.Hour), "api", "grafana", "other", labels).
-			AddRow("inc_a", "investigating", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-3*time.Hour), "api", "grafana", "alert-1", labels))
+			AddRow("inc_b", "API latency", "open", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-2*time.Hour), "api", "grafana", "other", labels).
+			AddRow("inc_a", "API latency", "investigating", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-3*time.Hour), "api", "grafana", "alert-1", labels))
 	mock.ExpectExec("UPDATE incidents").
 		WithArgs("API latency", "resolved", base, "high", sqlmock.AnyArg(), base, "inc_a").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -242,5 +242,33 @@ func eventColumns() []string {
 }
 
 func candidateColumns() []string {
-	return []string{"id", "status", "started_at", "last_event_at", "resolved_at", "severity", "environment", "affected_services", "created_at", "service", "source", "source_event_id", "labels"}
+	return []string{"id", "title", "status", "started_at", "last_event_at", "resolved_at", "severity", "environment", "affected_services", "created_at", "service", "source", "source_event_id", "labels"}
+}
+
+// TestTitleIdentifiesAlertsWithoutAService pins the correlation identity for
+// Grafana's default alerting payload, which names no service at all. Grouping
+// used to fall back on the literal "grafana" service; now the alert's own name
+// carries the identity, so repeated fires continue the same incident instead
+// of opening a new one each time.
+func TestTitleIdentifiesAlertsWithoutAService(t *testing.T) {
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	event := models.Event{
+		Timestamp:   base,
+		Title:       "Kube Job Failed",
+		Environment: "prod",
+		Labels:      map[string]string{"alertname": "Kube Job Failed"},
+	}
+	candidates := []incidentCandidate{
+		{ID: "inc_other_rule", Title: "Kube Node Not Ready", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod"},
+		{ID: "inc_same_rule", Title: "Kube Job Failed", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod"},
+	}
+
+	got, score, ok := selectCandidate(event, candidates)
+	if !ok || got.ID != "inc_same_rule" || score != 50 {
+		t.Fatalf("selected %s score %d ok %v, want inc_same_rule score 50", got.ID, score, ok)
+	}
+
+	if !acceptedResolution(event, got) {
+		t.Fatal("same alert name should authorize resolution")
+	}
 }
