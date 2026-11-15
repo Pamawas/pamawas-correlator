@@ -135,6 +135,10 @@ func main() {
 	}, handler)
 	handler = middleware.LoggingMiddleware("pamawas-correlator", handler)
 	handler = middleware.ErrorLoggingMiddleware("pamawas-correlator", handler)
+	// Service-to-service auth. Applied outermost of the loggers so a rejected
+	// request is still logged. /api/v1/trigger runs a correlation cycle on
+	// demand, so an unauthenticated caller could force that work at will.
+	handler = middleware.ServiceTokenAuth(cfg.ServiceToken, middleware.IsProbeOrMetricsPath)(handler)
 
 	// Create server
 	srv := &http.Server{

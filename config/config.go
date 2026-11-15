@@ -8,6 +8,7 @@ import (
 )
 
 type Config struct {
+	ServiceToken string
 	DatabaseURL string
 	Port        string
 	LogLevel    string
@@ -37,6 +38,9 @@ func Load() Config {
 	v.SetEnvPrefix("PAMAWAS_CORRELATOR")
 	// Don't use AutomaticEnv() - Kubernetes injects PAMAWAS_CORRELATOR_PORT=tcp://IP:PORT
 	// which would override our config. Explicitly bind only what we need.
+	if err := v.BindEnv("service_token", "PAMAWAS_SERVICE_TOKEN"); err != nil {
+		panic(fmt.Sprintf("failed to bind PAMAWAS_SERVICE_TOKEN env: %v", err))
+	}
 	if err := v.BindEnv("database_url", "DATABASE_URL", "PAMAWAS_CORRELATOR_DATABASE_URL"); err != nil {
 		panic(fmt.Sprintf("failed to bind DATABASE_URL env: %v", err))
 	}
@@ -107,6 +111,7 @@ func Load() Config {
 	}
 
 	cfg := Config{
+		ServiceToken:               v.GetString("service_token"),
 		DatabaseURL:                v.GetString("database_url"),
 		Port:                       v.GetString("port"),
 		LogLevel:                   v.GetString("log_level"),
