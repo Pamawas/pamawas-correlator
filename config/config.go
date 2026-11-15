@@ -20,6 +20,11 @@ type Config struct {
 	CircuitBreakerThreshold    int
 	CircuitBreakerResetTimeout time.Duration
 	OutboxMaxAttempts          int
+
+	// Inbound HTTP rate limiting (design review P5). Applies per route;
+	// /healthz, /ready and /metrics are exempt.
+	RateLimitRPS   float64
+	RateLimitBurst int
 }
 
 func Load() Config {
@@ -62,6 +67,12 @@ func Load() Config {
 	if err := v.BindEnv("outbox_max_attempts", "OUTBOX_MAX_ATTEMPTS"); err != nil {
 		panic(fmt.Sprintf("failed to bind OUTBOX_MAX_ATTEMPTS env: %v", err))
 	}
+	if err := v.BindEnv("rate_limit_rps", "RATE_LIMIT_RPS"); err != nil {
+		panic(fmt.Sprintf("failed to bind RATE_LIMIT_RPS env: %v", err))
+	}
+	if err := v.BindEnv("rate_limit_burst", "RATE_LIMIT_BURST"); err != nil {
+		panic(fmt.Sprintf("failed to bind RATE_LIMIT_BURST env: %v", err))
+	}
 
 	// Defaults
 	v.SetDefault("port", "8080")
@@ -73,6 +84,8 @@ func Load() Config {
 	v.SetDefault("circuit_breaker_threshold", 5)
 	v.SetDefault("circuit_breaker_reset_timeout", "30s")
 	v.SetDefault("outbox_max_attempts", 5)
+	v.SetDefault("rate_limit_rps", 10)
+	v.SetDefault("rate_limit_burst", 20)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -104,6 +117,8 @@ func Load() Config {
 		CircuitBreakerThreshold:    v.GetInt("circuit_breaker_threshold"),
 		CircuitBreakerResetTimeout: cbResetTimeout,
 		OutboxMaxAttempts:          v.GetInt("outbox_max_attempts"),
+		RateLimitRPS:               v.GetFloat64("rate_limit_rps"),
+		RateLimitBurst:             v.GetInt("rate_limit_burst"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -133,6 +148,12 @@ func (c Config) Validate() error {
 	}
 	if c.OutboxMaxAttempts < 1 {
 		return fmt.Errorf("outbox_max_attempts must be >= 1")
+	}
+	if c.RateLimitRPS <= 0 {
+		return fmt.Errorf("rate_limit_rps must be positive")
+	}
+	if c.RateLimitBurst < 1 {
+		return fmt.Errorf("rate_limit_burst must be >= 1")
 	}
 	return nil
 }

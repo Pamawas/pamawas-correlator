@@ -129,6 +129,10 @@ func main() {
 
 	// Wrap router with middleware
 	var handler http.Handler = r
+	handler = middleware.RateLimitMiddleware("pamawas-correlator", map[string]middleware.RouteLimit{
+		"/api/v1/trigger": {RPS: cfg.RateLimitRPS, Burst: cfg.RateLimitBurst},
+		"/api/v1/status":  {RPS: cfg.RateLimitRPS, Burst: cfg.RateLimitBurst},
+	}, handler)
 	handler = middleware.LoggingMiddleware("pamawas-correlator", handler)
 	handler = middleware.ErrorLoggingMiddleware("pamawas-correlator", handler)
 
