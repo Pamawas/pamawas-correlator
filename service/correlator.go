@@ -1047,10 +1047,16 @@ func (c *Correlator) cleanupDeliveredOutbox() error {
 			}
 		}
 	}()
+	// Bind the cutoff as a timestamp rather than binding the duration and
+	// subtracting it in SQL: an untyped parameter next to `now()` makes
+	// Postgres resolve `now() - $1` as timestamp-minus-timestamp, which yields
+	// an interval and fails with "operator does not exist: timestamptz <
+	// interval". Computing the cutoff here is unambiguous.
+	cutoff := time.Now().Add(-outboxRetention)
 	_, err = tx.ExecContext(c.ctx, `
 		DELETE FROM investigation_outbox
-		WHERE status = 'delivered' AND updated_at < now() - $1
-	`, outboxRetention)
+		WHERE status = 'delivered' AND updated_at < $1
+	`, cutoff)
 	if err != nil {
 		return err
 	}
