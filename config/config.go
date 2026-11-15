@@ -106,8 +106,8 @@ func Load() Config {
 		OutboxMaxAttempts:          v.GetInt("outbox_max_attempts"),
 	}
 
-	if cfg.DatabaseURL == "" {
-		panic("DATABASE_URL not set (config file or PAMAWAS_CORRELATOR_DATABASE_URL / DATABASE_URL env var)")
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid configuration: %v", err))
 	}
 	return cfg
 }

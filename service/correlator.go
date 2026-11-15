@@ -981,7 +981,7 @@ func (c *Correlator) applyOutboxResponseStatus(item outboxItem, resp *http.Respo
 		// Copy the exhausted row into the dead-letter table before flipping its
 		// status, in the same transaction, so a row can never be lost between
 		// "retryable forever" and "terminal with no trace".
-		if _, err := tx.ExecContext(c.ctx, `
+		if _, err = tx.ExecContext(c.ctx, `
 			INSERT INTO investigation_outbox_dead_letter
 			    (id, incident_id, contract_version, request_key_hash, reason, attempts, safe_error_code)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
