@@ -94,7 +94,17 @@ func main() {
 	// Initialize correlator service
 	investigatorURL := os.Getenv("INVESTIGATOR_URL")
 	serviceToken := os.Getenv("PAMAWAS_SERVICE_TOKEN")
-	correlator := service.NewCorrelator(db, cfg.TimeWindow, cfg.Interval, cfg.Mode, m, investigatorURL, serviceToken)
+	correlator := service.NewCorrelator(db, service.CorrelatorConfig{
+		TimeWindow:              cfg.TimeWindow,
+		Interval:                cfg.Interval,
+		Mode:                    cfg.Mode,
+		Metrics:                 m,
+		InvestigatorURL:         investigatorURL,
+		ServiceToken:            serviceToken,
+		CircuitBreakerThreshold: cfg.CircuitBreakerThreshold,
+		CircuitBreakerReset:     cfg.CircuitBreakerResetTimeout,
+		OutboxMaxAttempts:       cfg.OutboxMaxAttempts,
+	})
 
 	// Initialize handlers
 	h := handlers.NewHandler(db, cfg, m, investigatorURL)

@@ -28,10 +28,14 @@ const (
 	maxEventsPerCycle          = 500
 	defaultCycleTimeout        = 2 * time.Minute
 	defaultShutdownTimeout     = 15 * time.Second
-	circuitBreakerThreshold    = 5
-	circuitBreakerResetTimeout = 30 * time.Second
 	outboxRetention            = 24 * time.Hour
 	outboxCleanupEveryTicks    = 120 // 120 * 30s = 1 hour
+
+	// outboxReasonIncidentCreated is the API-level investigation reason written
+	// to investigation_outbox.reason. The schema constrains that column to
+	// 'incident_created'/'incident_resolved'; it is NOT the correlation reason
+	// (that lives on incident_events.correlation_reason).
+	outboxReasonIncidentCreated = "incident_created"
 )
 
 var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
@@ -125,19 +129,30 @@ func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) 
 		fingerprint != "" && fingerprint == candidate.Labels["grafana_fingerprint"]
 }
 
+// CircuitState is the typed state of the circuit breaker. Replaces the
+// previous raw strings ("closed"/"open"/"half-open") per the design review
+// recommendation to use an enum for breaker state.
+type CircuitState string
+
+const (
+	CircuitClosed   CircuitState = "closed"
+	CircuitOpen     CircuitState = "open"
+	CircuitHalfOpen CircuitState = "half-open"
+)
+
 // circuitBreaker tracks consecutive failures to the investigator and stops sending requests when unhealthy.
 type circuitBreaker struct {
 	mu           sync.Mutex
 	failures     int
 	lastFailure  time.Time
-	state        string // "closed", "open", "half-open"
+	state        CircuitState
 	threshold    int
 	resetTimeout time.Duration
 }
 
 func newCircuitBreaker(threshold int, resetTimeout time.Duration) *circuitBreaker {
 	return &circuitBreaker{
-		state:        "closed",
+		state:        CircuitClosed,
 		threshold:    threshold,
 		resetTimeout: resetTimeout,
 	}
@@ -146,9 +161,9 @@ func newCircuitBreaker(threshold int, resetTimeout time.Duration) *circuitBreake
 func (cb *circuitBreaker) allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	if cb.state == "open" {
+	if cb.state == CircuitOpen {
 		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			cb.state = "half-open"
+			cb.state = CircuitHalfOpen
 			return true
 		}
 		return false
@@ -160,7 +175,7 @@ func (cb *circuitBreaker) recordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.failures = 0
-	cb.state = "closed"
+	cb.state = CircuitClosed
 }
 
 func (cb *circuitBreaker) recordFailure() {
@@ -169,7 +184,7 @@ func (cb *circuitBreaker) recordFailure() {
 	cb.failures++
 	cb.lastFailure = time.Now()
 	if cb.failures >= cb.threshold {
-		cb.state = "open"
+		cb.state = CircuitOpen
 	}
 }
 
@@ -197,29 +212,51 @@ type Correlator struct {
 	circuitBreaker  *circuitBreaker
 	cycleTimeout    time.Duration
 	shutdownTimeout time.Duration
+
+	// Retry budget for outbox delivery attempts. When attempts reaches
+	// outboxMaxAttempts the row is copied to investigation_outbox_dead_letter
+	// and marked failed_terminal (no further retries).
+	outboxMaxAttempts int
 }
 
-func NewCorrelator(db *sql.DB, timeWindow, interval time.Duration, mode string, m *metrics.Metrics, investigatorURL, serviceToken string) *Correlator {
+// CorrelatorConfig carries the constructor parameters for NewCorrelator.
+// Circuit-breaker and retry-budget settings are centralized here (loaded from
+// config.Config); callers must supply validated values — config.Config.
+// Validate is the single place that enforces ranges.
+type CorrelatorConfig struct {
+	TimeWindow              time.Duration
+	Interval                time.Duration
+	Mode                    string
+	Metrics                 *metrics.Metrics
+	InvestigatorURL         string
+	ServiceToken            string
+	CircuitBreakerThreshold int
+	CircuitBreakerReset     time.Duration
+	OutboxMaxAttempts       int
+}
+
+func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Correlator{
 		db:              db,
-		timeWindow:      timeWindow,
-		interval:        interval,
-		mode:            mode,
+		timeWindow:      cfg.TimeWindow,
+		interval:        cfg.Interval,
+		mode:            cfg.Mode,
 		ctx:             ctx,
 		cancelFunc:      cancel,
 		startTime:       time.Now(),
-		metrics:         m,
+		metrics:         cfg.Metrics,
 		now:             time.Now,
 		newIncidentID:   func(time.Time) string { return "inc_" + uuid.NewString() },
-		investigatorURL: investigatorURL,
-		serviceToken:    serviceToken,
+		investigatorURL: cfg.InvestigatorURL,
+		serviceToken:    cfg.ServiceToken,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		circuitBreaker:  newCircuitBreaker(circuitBreakerThreshold, circuitBreakerResetTimeout),
-		cycleTimeout:    defaultCycleTimeout,
-		shutdownTimeout: defaultShutdownTimeout,
+		circuitBreaker:    newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
+		cycleTimeout:      defaultCycleTimeout,
+		shutdownTimeout:   defaultShutdownTimeout,
+		outboxMaxAttempts: cfg.OutboxMaxAttempts,
 	}
 }
 
@@ -233,7 +270,7 @@ func (c *Correlator) StartTime() time.Time { return c.startTime }
 func (c *Correlator) CircuitBreakerState() string {
 	c.circuitBreaker.mu.Lock()
 	defer c.circuitBreaker.mu.Unlock()
-	return c.circuitBreaker.state
+	return string(c.circuitBreaker.state)
 }
 
 func (c *Correlator) Correlate() error {
@@ -337,11 +374,17 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	if execErr != nil {
 		return false, false, execErr
 	}
-	// Only create an investigation outbox for incident_created, not for resolution.
-	// A resolved incident does not need investigation.
+	// Only dispatch an investigation for a newly created or extended incident.
+	// A resolution needs no investigation; it is handled by the reporter's
+	// resolve-notification flow.
+	//
+	// `reason` on the outbox row is the API-level investigation reason
+	// (schema CHECK allows only 'incident_created'/'incident_resolved'). The
+	// correlation reason lives on incident_events.correlation_reason and must
+	// not be written here.
 	if reason != "resolution_of_open_incident" {
 		key := investigationRequestKey(incidentID, event.ID)
-		_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, reason, now)
+		_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, outboxReasonIncidentCreated, now)
 		if execErr != nil {
 			return false, false, execErr
 		}
@@ -538,6 +581,7 @@ func (c *Correlator) processOutbox() error {
 			return err
 		}
 		if len(items) == 0 {
+			c.updateOutboxPendingGauge()
 			return nil
 		}
 
@@ -549,7 +593,28 @@ func (c *Correlator) processOutbox() error {
 			}
 		}
 	}
+	c.updateOutboxPendingGauge()
 	return nil
+}
+
+// updateOutboxPendingGauge sets the correlator_outbox_pending gauge to the
+// number of rows still awaiting delivery (pending, retryable, or leased with a
+// live lease). The gauge was previously declared but never populated.
+func (c *Correlator) updateOutboxPendingGauge() {
+	if c.metrics == nil {
+		return
+	}
+	var count int
+	if err := c.db.QueryRowContext(c.ctx, `
+		SELECT COUNT(*) FROM investigation_outbox
+		WHERE status = 'pending'
+		   OR status = 'retryable'
+		   OR (status = 'leased' AND (lease_expires_at IS NULL OR lease_expires_at > now()))
+	`).Scan(&count); err != nil {
+		log.Error().Err(err).Msg("Failed to count pending outbox rows")
+		return
+	}
+	c.metrics.OutboxPendingGauge.Set(float64(count))
 }
 
 // fetchAndLeaseOutboxItems queries pending outbox items and leases them in a
@@ -635,8 +700,13 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 // calls the investigator API outside of any transaction, and applies the response
 // status to the outbox record in its own short transaction.
 func (c *Correlator) processOutboxItem(item outboxItem) error {
-	// If the circuit breaker is open, skip the HTTP call and retry later.
+	// If the circuit breaker is open, skip the HTTP call and retry later —
+	// unless the retry budget is already exhausted, in which case the row is
+	// dead-lettered instead of looping forever behind the breaker.
 	if !c.circuitBreaker.allow() {
+		if item.attempts >= c.outboxMaxAttempts {
+			return c.deadLetterExhausted(item)
+		}
 		return c.markOutboxRetryable(item.id, item.attempts, true)
 	}
 
@@ -663,6 +733,9 @@ func (c *Correlator) processOutboxItem(item outboxItem) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.circuitBreaker.recordFailure()
+		if item.attempts+1 >= c.outboxMaxAttempts {
+			return c.deadLetterExhausted(item)
+		}
 		return c.markOutboxRetryable(item.id, item.attempts, false)
 	}
 	defer func() {
@@ -678,7 +751,53 @@ func (c *Correlator) processOutboxItem(item outboxItem) error {
 		}
 	}()
 
-	return c.applyOutboxResponseStatusStandalone(item.id, resp)
+	return c.applyOutboxResponseStatus(item, resp)
+}
+
+// deadLetterExhausted copies an out-of-budget row to the dead-letter table and
+// marks it failed_terminal, in one transaction. Used when the circuit breaker
+// is open or the transport itself fails so many times that no HTTP response
+// status is ever observed — the budget must still apply.
+func (c *Correlator) deadLetterExhausted(item outboxItem) error {
+	tx, err := c.db.BeginTx(c.ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Error().Err(rbErr).Msg("Failed to rollback transaction")
+			}
+		}
+	}()
+	if _, err := tx.ExecContext(c.ctx, `
+		INSERT INTO investigation_outbox_dead_letter
+		    (id, incident_id, contract_version, request_key_hash, reason, attempts, safe_error_code)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO NOTHING
+	`, item.id, item.incidentID, item.contractVersion, item.requestKeyHash,
+		item.reason, item.attempts, "RETRY_BUDGET_EXHAUSTED"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(c.ctx, `
+		UPDATE investigation_outbox
+		SET status = 'failed_terminal', safe_error_code = 'RETRY_BUDGET_EXHAUSTED', updated_at = now()
+		WHERE id = $1
+	`, item.id); err != nil {
+		return err
+	}
+	rollback = false
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Warn().
+		Str("outbox_id", item.id).
+		Str("incident_id", item.incidentID).
+		Int("attempts", item.attempts).
+		Int("max_attempts", c.outboxMaxAttempts).
+		Msg("outbox retry budget exhausted; row dead-lettered")
+	return nil
 }
 
 // leaseOutboxItem transitions a single outbox item to the 'leased' state.
@@ -789,12 +908,20 @@ func (c *Correlator) markOutboxRetryable(id string, attempts int, circuitOpen bo
 	return tx.Commit()
 }
 
-// applyOutboxResponseStatusStandalone maps an investigator HTTP response status
-// code to the corresponding outbox status update, managed in its own transaction.
-func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *http.Response) error {
+// applyOutboxResponseStatus maps an investigator HTTP response status code to
+// the corresponding outbox status update, managed in its own transaction.
+//
+// A 5xx on a row that has reached its retry budget (attempts+1 >=
+// outboxMaxAttempts) is dead-lettered instead of retried: the row is copied to
+// investigation_outbox_dead_letter (which has no FK to incidents, so it
+// survives incident deletion) and marked failed_terminal with
+// safe_error_code='RETRY_BUDGET_EXHAUSTED'. This is the P1 "no infinite retry
+// loops" guarantee from the design review.
+func (c *Correlator) applyOutboxResponseStatus(item outboxItem, resp *http.Response) error {
 	var status string
 	var safeErrorCode string
 	recordFailure := false
+	deadLetter := false
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -804,21 +931,30 @@ func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *ht
 			c.metrics.OutboxDeliveredTotal.WithLabelValues("success").Inc()
 		}
 	case resp.StatusCode == 409:
+		// 409 means the investigator already has a run for this
+		// (incident_id, request_key_hash): the dispatch reached it and was
+		// idempotently rejected, which is a success for the outbox worker.
 		status = "delivered"
-		safeErrorCode = "'INVESTIGATOR_CONFLICT'"
+		safeErrorCode = "INVESTIGATOR_CONFLICT"
 		c.circuitBreaker.recordSuccess()
 		if c.metrics != nil {
 			c.metrics.OutboxDeliveredTotal.WithLabelValues("conflict").Inc()
 		}
 	case resp.StatusCode >= 500:
-		status = "retryable"
 		recordFailure = true
 		if c.metrics != nil {
 			c.metrics.OutboxFailedTotal.WithLabelValues("server_error").Inc()
 		}
+		if item.attempts+1 >= c.outboxMaxAttempts {
+			deadLetter = true
+			status = "failed_terminal"
+			safeErrorCode = "RETRY_BUDGET_EXHAUSTED"
+		} else {
+			status = "retryable"
+		}
 	default:
 		status = "failed_terminal"
-		safeErrorCode = "'INVESTIGATOR_ERROR'"
+		safeErrorCode = "INVESTIGATOR_ERROR"
 		if c.metrics != nil {
 			c.metrics.OutboxFailedTotal.WithLabelValues("client_error").Inc()
 		}
@@ -841,11 +977,37 @@ func (c *Correlator) applyOutboxResponseStatusStandalone(itemID string, resp *ht
 		}
 	}()
 
+	if deadLetter {
+		// Copy the exhausted row into the dead-letter table before flipping its
+		// status, in the same transaction, so a row can never be lost between
+		// "retryable forever" and "terminal with no trace".
+		if _, err := tx.ExecContext(c.ctx, `
+			INSERT INTO investigation_outbox_dead_letter
+			    (id, incident_id, contract_version, request_key_hash, reason, attempts, safe_error_code)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO NOTHING
+		`, item.id, item.incidentID, item.contractVersion, item.requestKeyHash,
+			item.reason, item.attempts+1, safeErrorCode); err != nil {
+			return err
+		}
+		log.Warn().
+			Str("outbox_id", item.id).
+			Str("incident_id", item.incidentID).
+			Int("attempts", item.attempts+1).
+			Int("max_attempts", c.outboxMaxAttempts).
+			Msg("outbox retry budget exhausted; row dead-lettered")
+	}
+
 	query := `UPDATE investigation_outbox SET status = $1, updated_at = now() WHERE id = $2`
-	args := []interface{}{status, itemID}
+	args := []interface{}{status, item.id}
 	if safeErrorCode != "" {
 		query = `UPDATE investigation_outbox SET status = $1, safe_error_code = $2, updated_at = now() WHERE id = $3`
-		args = []interface{}{status, safeErrorCode, itemID}
+		args = []interface{}{status, safeErrorCode, item.id}
+	}
+	if status == "retryable" {
+		query = `UPDATE investigation_outbox SET status = $1, updated_at = now(),
+		         next_attempt_at = now() + ($2 * interval '1 minute') WHERE id = $3`
+		args = []interface{}{status, backoffMinutes(item.attempts), item.id}
 	}
 	_, err = tx.ExecContext(c.ctx, query, args...)
 	if err != nil {
