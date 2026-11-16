@@ -30,6 +30,14 @@ func TracingMiddleware(serviceName string, next http.Handler) http.Handler {
 	propagator := traceContextPropagator()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Probes and scrapes are not requests anyone will debug. Tracing them
+		// fills the backend with spans that explain nothing and, at a sample
+		// ratio below 1, competes with the traffic that does matter.
+		if isProbePath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Continue an existing trace when the caller supplied one.
 		ctx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 
@@ -103,4 +111,23 @@ func TraceIDs(ctx context.Context) (traceID, spanID string) {
 		return "", ""
 	}
 	return sc.TraceID().String(), sc.SpanID().String()
+}
+
+// probePaths are liveness, readiness and scrape endpoints.
+//
+// They run every few seconds forever, they have no incident behind them, and
+// nobody opens a trace to ask why /healthz took 400 microseconds. Spanning them
+// buries the requests that do matter, so they are served untraced.
+var probePaths = map[string]struct{}{
+	"/health":  {},
+	"/healthz": {},
+	"/livez":   {},
+	"/ready":   {},
+	"/readyz":  {},
+	"/metrics": {},
+}
+
+func isProbePath(path string) bool {
+	_, ok := probePaths[path]
+	return ok
 }
