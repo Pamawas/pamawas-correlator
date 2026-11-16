@@ -35,7 +35,7 @@ type Metrics struct {
 // Names follow the pamawas_<subsystem>_<metric> convention (design review
 // P3): namespace `pamawas`, subsystem `correlator` or `correlator_outbox`.
 func NewMetrics() *Metrics {
-	return &Metrics{
+	m := &Metrics{
 		CorrelationCyclesTotal: promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "pamawas",
@@ -149,4 +149,13 @@ func NewMetrics() *Metrics {
 			},
 		),
 	}
+
+	// Create the unlinked-event series at zero. An absent series cannot be told
+	// apart from "the metric has not been wired up yet", and the healthy value
+	// for this counter is exactly zero — it should be alertable as
+	// increase(...) > 0 without a `unless absent()` guard.
+	m.UnlinkedEventsTotal.WithLabelValues("resolved").Add(0)
+	m.UnlinkedEventsTotal.WithLabelValues("informational").Add(0)
+
+	return m
 }
