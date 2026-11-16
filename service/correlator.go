@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,11 +26,11 @@ const (
 	correlationPolicy  = "pamawas-correlation-v1"
 	correlationVersion = 1
 
-	maxEventsPerCycle          = 500
-	defaultCycleTimeout        = 2 * time.Minute
-	defaultShutdownTimeout     = 15 * time.Second
-	outboxRetention            = 24 * time.Hour
-	outboxCleanupEveryTicks    = 120 // 120 * 30s = 1 hour
+	maxEventsPerCycle       = 500
+	defaultCycleTimeout     = 2 * time.Minute
+	defaultShutdownTimeout  = 15 * time.Second
+	outboxRetention         = 24 * time.Hour
+	outboxCleanupEveryTicks = 120 // 120 * 30s = 1 hour
 
 	// outboxReasonIncidentCreated is the API-level investigation reason written
 	// to investigation_outbox.reason. The schema constrains that column to
@@ -38,106 +39,41 @@ const (
 	outboxReasonIncidentCreated = "incident_created"
 )
 
-var identityLabelScores = map[string]int{"alert_rule": 40, "namespace": 20, "workload": 20, "instance": 20}
+// Correlation decisions recorded per event (correlation_decisions.decision).
+const (
+	decisionNewIncident      = "new_incident"
+	decisionExtendedIncident = "extended_incident"
+	decisionResolvedIncident = "resolved_incident"
+	// decisionIgnored: the event produced no incident. A resolution with no open
+	// incident for its condition is the only case.
+	decisionIgnored = "ignored"
+)
 
+// incidentCandidate is an open incident that may receive the event being
+// processed. Only the columns the mutation needs are loaded.
 type incidentCandidate struct {
-	ID            string
-	Status        string
-	LastEventAt   time.Time
-	StartedAt     time.Time
-	CreatedAt     time.Time
-	Environment   string
-	Service       string
-	Source        string
-	SourceEventID string
-	Severity      string
-	Title         string
-	Labels        map[string]string
+	ID       string
+	Status   string
+	Severity string
 }
 
-func selectCandidate(event models.Event, candidates []incidentCandidate) (incidentCandidate, int, bool) {
-	var selected incidentCandidate
-	selectedScore := -1
-	found := false
-	for _, candidate := range candidates {
-		if candidate.Environment != event.Environment || (candidate.Status != "" && candidate.Status != "open" && candidate.Status != "investigating") {
-			continue
-		}
-		if event.Timestamp.After(candidate.LastEventAt.Add(15*time.Minute)) || event.Timestamp.Before(candidate.LastEventAt.Add(-5*time.Minute)) || event.Timestamp.After(candidate.StartedAt.Add(6*time.Hour)) {
-			continue
-		}
-		score := candidateScore(event, candidate)
-		if score < 50 {
-			continue
-		}
-		if !found || score > selectedScore || score == selectedScore && candidateBefore(candidate, selected) {
-			selected, selectedScore, found = candidate, score, true
-		}
+// eventIdentity returns the condition an event describes.
+//
+// Correlation is an identity problem, not a similarity problem. Two alerts
+// that share a service and a title are still two conditions when they differ
+// in any other label (koba-labs "Monitoring Target Down" on docker_cadvisor
+// versus on mariadb), and the same alert's firing and resolved events are one
+// condition. Grafana's `fingerprint` is a hash of exactly that label set, so
+// when it is present the match is exact.
+//
+// Events without a fingerprint fall back to the only identity they carry:
+// environment plus service plus alert title. That is coarser, but it is still
+// deterministic — an event either belongs to a condition or it does not.
+func eventIdentity(event models.Event) string {
+	if fingerprint := strings.TrimSpace(event.Labels["grafana_fingerprint"]); fingerprint != "" {
+		return "fp:" + fingerprint
 	}
-	return selected, selectedScore, found
-}
-
-func candidateScore(event models.Event, candidate incidentCandidate) int {
-	score := 0
-	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
-		score += 100
-	}
-	if grafanaFingerprintMatches(event, candidate) {
-		score += 100
-	}
-	if event.Service != "" && event.Service == candidate.Service {
-		score += 50
-	}
-	// The alert's own name is a real identity: Grafana's default alerting
-	// payload often names no service at all, only the rule. Without this,
-	// such events score below the match threshold and every re-fire would
-	// open a new incident instead of continuing the existing one.
-	if event.Title != "" && event.Title == candidate.Title {
-		score += 50
-	}
-	for label, weight := range identityLabelScores {
-		if event.Labels[label] != "" && event.Labels[label] == candidate.Labels[label] {
-			score += weight
-		}
-	}
-	return score
-}
-
-func candidateBefore(a, b incidentCandidate) bool {
-	if !a.LastEventAt.Equal(b.LastEventAt) {
-		return a.LastEventAt.After(b.LastEventAt)
-	}
-	if !a.CreatedAt.Equal(b.CreatedAt) {
-		return a.CreatedAt.Before(b.CreatedAt)
-	}
-	return a.ID < b.ID
-}
-
-func acceptedResolution(event models.Event, candidate incidentCandidate) bool {
-	if event.SourceEventID != "" && event.Source == candidate.Source && event.SourceEventID == candidate.SourceEventID {
-		return true
-	}
-	if grafanaFingerprintMatches(event, candidate) {
-		return true
-	}
-	if event.Title != "" && event.Title == candidate.Title {
-		return true
-	}
-	if event.Service == "" || event.Service != candidate.Service {
-		return false
-	}
-	for label := range identityLabelScores {
-		if event.Labels[label] != "" && event.Labels[label] == candidate.Labels[label] {
-			return true
-		}
-	}
-	return false
-}
-
-func grafanaFingerprintMatches(event models.Event, candidate incidentCandidate) bool {
-	fingerprint := event.Labels["grafana_fingerprint"]
-	return event.Source == "grafana" && candidate.Source == "grafana" &&
-		fingerprint != "" && fingerprint == candidate.Labels["grafana_fingerprint"]
+	return "cond:" + strings.ToLower(strings.TrimSpace(event.Service)) + "|" + strings.ToLower(strings.TrimSpace(event.Title))
 }
 
 // CircuitState is the typed state of the circuit breaker. Replaces the
@@ -369,14 +305,49 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 		return false, false, scanErr
 	}
 
-	candidates, err := loadAdjacentCandidates(ctx, tx, event)
+	identity := eventIdentity(event)
+	candidate, matched, err := loadOpenIncidentByIdentity(ctx, tx, event.Environment, identity)
 	if err != nil {
 		return false, false, err
 	}
-
-	candidate, _, matched := selectCandidate(event, candidates)
 	now := c.now()
-	incidentID, reason, created, mutationErr := c.applyIncidentMutation(ctx, tx, event, candidate, matched, now)
+
+	// Only a firing event can open an incident. Anything else either attaches
+	// to the incident for its identity or, when there is none, is recorded and
+	// skipped.
+	//
+	// A resolution that finds no open incident must NOT create one: the event
+	// says the condition recovered, so an incident created from it would claim
+	// the opposite, and no further event is coming to resolve it. This is what
+	// produced open incidents that were "down 15 minutes" in a digest that also
+	// listed them as recovered.
+	//
+	// An unlinked resolution is not silently normal, though. It means the firing
+	// never reached the correlator — a dropped webhook, a restart, a filtering
+	// mistake — and it is counted and logged as such so it can be alerted on
+	// rather than hidden.
+	if !matched && event.Status != "firing" {
+		if err := recordCorrelationDecision(ctx, tx, event.ID, decisionIgnored, "", now); err != nil {
+			return false, false, err
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return false, false, commitErr
+		}
+		rollback = false
+		if c.metrics != nil {
+			c.metrics.UnlinkedEventsTotal.WithLabelValues(event.Status).Inc()
+		}
+		log.Warn().
+			Str("event_id", event.ID).
+			Str("status", event.Status).
+			Str("service", event.Service).
+			Str("title", event.Title).
+			Str("identity", identity).
+			Msg("Event matched no open incident; recorded without creating one")
+		return true, false, nil
+	}
+
+	incidentID, reason, created, mutationErr := c.applyIncidentMutation(ctx, tx, event, identity, candidate, matched, now)
 	if mutationErr != nil {
 		return false, false, mutationErr
 	}
@@ -384,6 +355,9 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	_, execErr := tx.ExecContext(ctx, `INSERT INTO incident_events (incident_id,event_id,correlation_reason,policy_version,attached_at) VALUES ($1,$2,$3,$4,$5)`, incidentID, event.ID, reason, correlationVersion, now)
 	if execErr != nil {
 		return false, false, execErr
+	}
+	if err := recordCorrelationDecision(ctx, tx, event.ID, decisionForCorrelationReason(reason), incidentID, now); err != nil {
+		return false, false, err
 	}
 	// Only dispatch an investigation for a newly created or extended incident.
 	// A resolution needs no investigation; it is handled by the reporter's
@@ -413,7 +387,7 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	var event models.Event
 	var labels []byte
-	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, COALESCE(e.source_event_id, ''), e.type, e.occurred_at, COALESCE(e.service, ''), e.environment, e.severity, e.title, e.status, e.labels FROM events e WHERE NOT EXISTS (SELECT 1 FROM incident_events ie WHERE ie.event_id = e.id AND ie.policy_version = $1) ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
+	row := tx.QueryRowContext(ctx, `SELECT e.id, e.source, COALESCE(e.source_event_id, ''), e.type, e.occurred_at, COALESCE(e.service, ''), e.environment, e.severity, e.title, e.status, e.labels FROM events e WHERE NOT EXISTS (SELECT 1 FROM correlation_decisions cd WHERE cd.event_id = e.id AND cd.policy_version = $1) ORDER BY e.occurred_at, e.id FOR UPDATE SKIP LOCKED LIMIT 1`, correlationVersion)
 	if err := row.Scan(&event.ID, &event.Source, &event.SourceEventID, &event.Type, &event.Timestamp, &event.Service, &event.Environment, &event.Severity, &event.Title, &event.Status, &labels); err != nil {
 		return event, err
 	}
@@ -433,54 +407,79 @@ func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	return event, nil
 }
 
-// loadAdjacentCandidates queries open/investigating incidents in the same
-// environment that fall within the time-correlation window of the event.
-func loadAdjacentCandidates(ctx context.Context, tx *sql.Tx, event models.Event) ([]incidentCandidate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT i.id, i.title, i.status, i.started_at, i.last_event_at, i.resolved_at, i.severity, i.environment, i.affected_services, i.created_at, COALESCE((SELECT e2.service FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.source_event_id FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), ''), COALESCE((SELECT e2.labels || CASE WHEN e2.source='grafana' AND NULLIF(e2.raw_payload->'alerts'->0->>'fingerprint','') IS NOT NULL THEN jsonb_build_object('grafana_fingerprint', e2.raw_payload->'alerts'->0->>'fingerprint') ELSE '{}'::jsonb END FROM incident_events ie2 JOIN events e2 ON e2.id=ie2.event_id WHERE ie2.incident_id=i.id ORDER BY e2.occurred_at DESC LIMIT 1), '{}'::jsonb) FROM incidents i WHERE i.environment=$1 AND i.status IN ('open','investigating') AND i.last_event_at >= $2 AND i.last_event_at <= $3 AND i.started_at >= $4 ORDER BY i.last_event_at DESC, i.created_at, i.id FOR UPDATE OF i SKIP LOCKED`, event.Environment, event.Timestamp.Add(-15*time.Minute), event.Timestamp.Add(5*time.Minute), event.Timestamp.Add(-6*time.Hour))
+// loadOpenIncidentByIdentity finds the one open incident for a condition.
+//
+// There is at most one: migration 005 enforces
+// UNIQUE (environment, identity_key) WHERE status IN ('open','investigating').
+// That constraint is the real matcher — this query only has to look it up.
+// Resolved incidents are deliberately not candidates; an alert that fires
+// again after recovering is a new occurrence of the condition, and the
+// reporter's recurrence count is what tells the on-call engineer how often it
+// has happened.
+func loadOpenIncidentByIdentity(ctx context.Context, tx *sql.Tx, environment, identity string) (incidentCandidate, bool, error) {
+	var candidate incidentCandidate
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, status, severity
+		FROM incidents
+		WHERE environment = $1
+		  AND identity_key = $2
+		  AND status IN ('open', 'investigating')
+		FOR UPDATE
+	`, environment, identity).Scan(&candidate.ID, &candidate.Status, &candidate.Severity)
+	if err == sql.ErrNoRows {
+		return incidentCandidate{}, false, nil
+	}
 	if err != nil {
-		return nil, err
+		return incidentCandidate{}, false, err
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close rows")
-		}
-	}()
-
-	var candidates []incidentCandidate
-	for rows.Next() {
-		x, scanErr := scanCandidate(rows)
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		candidates = append(candidates, x)
-	}
-	return candidates, rows.Err()
+	return candidate, true, nil
 }
 
-// scanCandidate extracts a single incidentCandidate from a rows iterator.
-func scanCandidate(rows *sql.Rows) (incidentCandidate, error) {
-	var x incidentCandidate
-	var services pq.StringArray
-	var lb []byte
-	if err := rows.Scan(&x.ID, &x.Title, &x.Status, &x.StartedAt, &x.LastEventAt, new(sql.NullTime), &x.Severity, &x.Environment, &services, &x.CreatedAt, &x.Service, &x.Source, &x.SourceEventID, &lb); err != nil {
-		return x, err
+// recordCorrelationDecision marks an event as processed and records what the
+// correlator did with it.
+//
+// This is the "seen" marker, deliberately separate from incident_events: that
+// table is the incident↔event link, and an event that produces no incident has
+// nothing to link.
+func recordCorrelationDecision(ctx context.Context, tx *sql.Tx, eventID, decision, incidentID string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO correlation_decisions (event_id, policy_version, decision, incident_id, decided_at)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5)
+		ON CONFLICT (event_id, policy_version) DO NOTHING
+	`, eventID, correlationVersion, decision, incidentID, now)
+	return err
+}
+
+// decisionForCorrelationReason maps a correlation reason onto its recorded
+// decision.
+func decisionForCorrelationReason(reason string) string {
+	switch reason {
+	case "new_incident":
+		return decisionNewIncident
+	case "resolution_of_open_incident":
+		return decisionResolvedIncident
+	default:
+		return decisionExtendedIncident
 	}
-	x.Labels = map[string]string{}
-	if err := json.Unmarshal(lb, &x.Labels); err != nil {
-		return x, err
-	}
-	return x, nil
 }
 
 // applyIncidentMutation decides whether to INSERT a new incident or UPDATE an
 // existing matched candidate, then executes the appropriate statement.
 // Returns the resolved incident ID, correlation reason, whether a new incident
 // was created, and any execution error.
-func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, event models.Event, candidate incidentCandidate, matched bool, now time.Time) (string, string, bool, error) {
-	reduction := event.Status == "resolved" && matched && acceptedResolution(event, candidate)
+// applyIncidentMutation opens an incident for a new condition, or extends the
+// open incident for an existing one.
+//
+// The incident's identity columns — title, identity_key, affected_services —
+// are written once, when the incident is opened, and never overwritten. They
+// describe the condition; a later event can only move the incident's status,
+// its last-seen time and its severity. Overwriting them is what let a RAM
+// incident turn into a "Monitoring Target Down" incident for another host.
+func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, event models.Event, identity string, candidate incidentCandidate, matched bool, now time.Time) (string, string, bool, error) {
+	reduction := event.Status == "resolved" && matched
 	reason := "new_incident"
 	if matched {
-		reason = "same_service_time_window"
+		reason = "same_condition"
 		if reduction {
 			reason = "resolution_of_open_incident"
 		}
@@ -489,7 +488,11 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 	var incidentID string
 	if !matched {
 		incidentID = c.newIncidentID(event.Timestamp)
-		_, err := tx.ExecContext(ctx, `INSERT INTO incidents (id,title,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at) VALUES ($1,$2,'open',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, incidentID, event.Title, event.Timestamp, nil, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now, now)
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO incidents
+				(id,title,identity_key,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at)
+			VALUES ($1,$2,$3,'open',$4,$4,NULL,$5,$6,$7,$8,$9,$10,$10)
+		`, incidentID, event.Title, identity, event.Timestamp, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now)
 		if err != nil {
 			return "", "", false, err
 		}
@@ -500,7 +503,15 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 		if reduction {
 			status = "resolved"
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE incidents SET title=$1,status=$2,last_event_at=GREATEST(last_event_at,$3),resolved_at=CASE WHEN $2='resolved' THEN GREATEST(COALESCE(resolved_at,$3),$3) ELSE resolved_at END,severity=$4,affected_services=$5,updated_at=$6 WHERE id=$7`, event.Title, status, event.Timestamp, event.Severity, pq.Array(nonEmpty(event.Service)), now, incidentID)
+		_, err := tx.ExecContext(ctx, `
+			UPDATE incidents
+			SET status = $1,
+			    last_event_at = GREATEST(last_event_at, $2),
+			    resolved_at = CASE WHEN $1 = 'resolved' THEN GREATEST(COALESCE(resolved_at, $2), $2) ELSE NULL END,
+			    severity = $3,
+			    updated_at = $4
+			WHERE id = $5
+		`, status, event.Timestamp, event.Severity, now, incidentID)
 		if err != nil {
 			return "", "", false, err
 		}

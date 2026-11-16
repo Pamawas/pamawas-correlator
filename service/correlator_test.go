@@ -8,97 +8,56 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
 	"github.com/Pamawas/pamawas-correlator/models"
 )
 
-func TestRankCandidatesUsesV1ScoresAndTieBreaks(t *testing.T) {
-	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	event := models.Event{
-		Source:        "grafana",
-		SourceEventID: "alert-1",
-		Timestamp:     base,
-		Service:       "api",
-		Environment:   "prod",
-		Labels: map[string]string{
-			"alert_rule": "Latency",
-			"namespace":  "core",
-			"workload":   "api-v2",
-			"instance":   "api-1",
-			"cluster":    "shared",
-		},
-	}
+// TestEventIdentitySeparatesAlertsThatShareAServiceAndTitle pins the defect
+// that made incidents merge across hosts. koba-labs "Monitoring Target Down"
+// on docker_cadvisor and on mariadb share both service and title; Grafana
+// distinguishes them by fingerprint, and so must the correlator.
+func TestEventIdentitySeparatesAlertsThatShareAServiceAndTitle(t *testing.T) {
+	base := models.Event{Service: "koba-labs", Title: "Monitoring Target Down", Environment: "production"}
 
-	candidates := []incidentCandidate{
-		{ID: "inc_source", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod", Source: "grafana", SourceEventID: "alert-1"},
-		{ID: "inc_labels", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod", Service: "api", Labels: map[string]string{"alert_rule": "Latency", "namespace": "core", "workload": "api-v2", "instance": "api-1"}},
-		{ID: "inc_weak", Status: "open", LastEventAt: base, StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-3 * time.Hour), Environment: "prod", Labels: map[string]string{"cluster": "shared"}},
-	}
+	cadvisor := base
+	cadvisor.Labels = map[string]string{"grafana_fingerprint": "7aaa5e768ad620f4"}
+	mariadb := base
+	mariadb.Labels = map[string]string{"grafana_fingerprint": "ccfb7cc2cb3a3c54"}
 
-	got, score, ok := selectCandidate(event, candidates)
-	if !ok {
-		t.Fatal("expected a candidate")
-	}
-	if got.ID != "inc_labels" || score != 150 {
-		t.Fatalf("selected %s score %d, want inc_labels score 150", got.ID, score)
+	if eventIdentity(cadvisor) == eventIdentity(mariadb) {
+		t.Fatalf("different alerts on the same host must not share an identity: %q", eventIdentity(cadvisor))
 	}
 }
 
-func TestRankCandidatesAppliesWindowsAndDeterministicTies(t *testing.T) {
-	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	event := models.Event{Timestamp: base, Service: "api", Environment: "prod"}
-	candidates := []incidentCandidate{
-		{ID: "inc_after_window", Status: "open", LastEventAt: base.Add(-15*time.Minute - time.Nanosecond), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-3 * time.Hour), Environment: "prod", Service: "api"},
-		{ID: "inc_before_window", Status: "open", LastEventAt: base.Add(5*time.Minute + time.Nanosecond), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-3 * time.Hour), Environment: "prod", Service: "api"},
-		{ID: "inc_span", Status: "open", LastEventAt: base, StartedAt: base.Add(-6*time.Hour - time.Nanosecond), CreatedAt: base.Add(-3 * time.Hour), Environment: "prod", Service: "api"},
-		{ID: "inc_b", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod", Service: "api"},
-		{ID: "inc_a", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod", Service: "api"},
-	}
+// TestEventIdentityPairsFiringWithResolution is the property the whole design
+// rests on: a firing and its resolution describe the same condition.
+func TestEventIdentityPairsFiringWithResolution(t *testing.T) {
+	labels := map[string]string{"grafana_fingerprint": "5ef6d3ea2e13d8e8"}
+	firing := models.Event{Service: "koba-labs", Title: "RAM", Status: "firing", Labels: labels}
+	resolved := models.Event{Service: "koba-labs", Title: "RAM", Status: "resolved", Labels: labels}
 
-	got, score, ok := selectCandidate(event, candidates)
-	if !ok || got.ID != "inc_a" || score != 50 {
-		t.Fatalf("selected %+v score %d ok %v, want inc_a score 50", got, score, ok)
+	if eventIdentity(firing) != eventIdentity(resolved) {
+		t.Fatalf("firing identity %q != resolved identity %q", eventIdentity(firing), eventIdentity(resolved))
 	}
 }
 
-func TestResolutionRequiresAcceptedIdentity(t *testing.T) {
-	event := models.Event{Source: "grafana", SourceEventID: "alert-1", Service: "api", Labels: map[string]string{"namespace": "core"}}
+// TestEventIdentityFallsBackToServiceAndTitle covers sources that carry no
+// fingerprint. The fallback is coarser but still deterministic, so it never
+// merges two alerts that differ in either field.
+func TestEventIdentityFallsBackToServiceAndTitle(t *testing.T) {
+	a := models.Event{Service: "api", Title: "Latency", Labels: map[string]string{}}
+	b := models.Event{Service: "api", Title: "Errors", Labels: map[string]string{}}
+	c := models.Event{Service: "web", Title: "Latency", Labels: map[string]string{}}
 
-	if !acceptedResolution(event, incidentCandidate{Source: "grafana", SourceEventID: "alert-1"}) {
-		t.Fatal("strong source identity should resolve")
+	if eventIdentity(a) != eventIdentity(models.Event{Service: " API ", Title: "latency"}) {
+		t.Fatal("fallback identity must normalise case and whitespace")
 	}
-	if !acceptedResolution(event, incidentCandidate{Service: "api", Labels: map[string]string{"namespace": "core"}}) {
-		t.Fatal("service plus identity label should resolve")
-	}
-	if acceptedResolution(event, incidentCandidate{Service: "api"}) {
-		t.Fatal("service alone must not resolve")
+	if eventIdentity(a) == eventIdentity(b) || eventIdentity(a) == eventIdentity(c) {
+		t.Fatal("different title or service must not share an identity")
 	}
 }
 
-func TestGrafanaFingerprintMatchesResolutionCandidate(t *testing.T) {
-	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	event := models.Event{
-		Source:      "grafana",
-		Timestamp:   base,
-		Service:     "api",
-		Environment: "prod",
-		Status:      "resolved",
-		Labels:      map[string]string{"grafana_fingerprint": "fingerprint-1"},
-	}
-	candidates := []incidentCandidate{
-		{ID: "wrong", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), Environment: "prod", Service: "api", Source: "grafana", Labels: map[string]string{"grafana_fingerprint": "fingerprint-2"}},
-		{ID: "match", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), Environment: "prod", Service: "api", Source: "grafana", Labels: map[string]string{"grafana_fingerprint": "fingerprint-1"}},
-	}
-
-	got, score, ok := selectCandidate(event, candidates)
-	if !ok || got.ID != "match" || score != 150 {
-		t.Fatalf("selected %+v score %d ok %v, want matching fingerprint candidate with score 150", got, score, ok)
-	}
-	if !acceptedResolution(event, got) {
-		t.Fatal("matching Grafana fingerprint should authorize resolution")
-	}
-}
-
-func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
+func TestProcessNextEventExtendsAndResolvesOpenIncident(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -106,20 +65,21 @@ func TestProcessNextEventExtendsAndResolvesCandidateAtomically(t *testing.T) {
 	defer db.Close()
 
 	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	labels := []byte(`{"namespace":"core"}`)
+	labels := []byte(`{"grafana_fingerprint":"fp-1"}`)
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
-		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_1", "grafana", "alert-1", "alert", base, "api", "prod", "high", "API latency", "resolved", labels))
-	mock.ExpectQuery("(?s)SELECT i.id.*FOR UPDATE OF i SKIP LOCKED").
-		WithArgs("prod", base.Add(-15*time.Minute), base.Add(5*time.Minute), base.Add(-6*time.Hour)).
-		WillReturnRows(sqlmock.NewRows(candidateColumns()).
-			AddRow("inc_b", "API latency", "open", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-2*time.Hour), "api", "grafana", "other", labels).
-			AddRow("inc_a", "API latency", "investigating", base.Add(-time.Hour), base.Add(-time.Minute), nil, "warning", "prod", "{api}", base.Add(-3*time.Hour), "api", "grafana", "alert-1", labels))
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_1", "grafana", "", "alert", base, "api", "prod", "high", "API latency", "resolved", labels))
+	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity"}).AddRow("inc_1", "open", "warning"))
 	mock.ExpectExec("UPDATE incidents").
-		WithArgs("API latency", "resolved", base, "high", sqlmock.AnyArg(), base, "inc_a").
+		WithArgs("resolved", base, "high", base, "inc_1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").
-		WithArgs("inc_a", "evt_1", "resolution_of_open_incident", 1, base).
+		WithArgs("inc_1", "evt_1", "resolution_of_open_incident", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_1", 1, "resolved_incident", "inc_1", base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -144,14 +104,17 @@ func TestProcessNextEventCreatesIncidentAndOutbox(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_2", "prometheus", "", "alert", base, "db", "prod", "critical", "DB down", "firing", []byte(`{}`)))
-	mock.ExpectQuery("(?s)SELECT i.id.*FOR UPDATE OF i SKIP LOCKED").
-		WithArgs("prod", base.Add(-15*time.Minute), base.Add(5*time.Minute), base.Add(-6*time.Hour)).
-		WillReturnRows(sqlmock.NewRows(candidateColumns()))
+	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "cond:db|db down").
+		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec("INSERT INTO incidents").
-		WithArgs("inc_new", "DB down", base, nil, "critical", "prod", sqlmock.AnyArg(), correlationPolicy, correlationVersion, base, base).
+		WithArgs("inc_new", "DB down", "cond:db|db down", base, "critical", "prod", sqlmock.AnyArg(), correlationPolicy, correlationVersion, base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").
 		WithArgs("inc_new", "evt_2", "new_incident", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_2", 1, "new_incident", "inc_new", base).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	requestKey := investigationRequestKey("inc_new", "evt_2")
 	mock.ExpectExec("INSERT INTO investigation_outbox").
@@ -169,7 +132,49 @@ func TestProcessNextEventCreatesIncidentAndOutbox(t *testing.T) {
 	}
 }
 
-func TestProcessNextEventRollsBackWhenOutboxInsertFails(t *testing.T) {
+// TestResolutionWithoutOpenIncidentCreatesNoIncident is the regression test for
+// the contradiction the daily digest showed: one condition listed as open
+// "since 20:52" while the recovered section said it was down 15 minutes. The
+// cause was a resolution with no open incident creating a new open incident.
+//
+// It also pins the operator contract: an unlinked resolution is recorded and
+// counted, never silently dropped, because in steady state it should not
+// happen at all.
+func TestResolutionWithoutOpenIncidentCreatesNoIncident(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	labels := []byte(`{"grafana_fingerprint":"fp-orphan"}`)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_9", "grafana", "", "alert", base, "api", "prod", "high", "API latency", "resolved", labels))
+	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-orphan").
+		WillReturnError(sql.ErrNoRows)
+	// No INSERT INTO incidents, no INSERT INTO incident_events, no outbox.
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_9", 1, "ignored", "", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	c := &Correlator{db: db, now: func() time.Time { return base }, newIncidentID: func(time.Time) string { return "inc_must_not_exist" }}
+	processed, created, err := c.processNextEvent(context.Background())
+	if err != nil || !processed || created {
+		t.Fatalf("processed=%v created=%v err=%v", processed, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestExtendingAnIncidentDoesNotRewriteItsIdentity guards the column that made
+// incidents drift: a later event may move status, last-seen time and severity,
+// but never title or affected_services.
+func TestExtendingAnIncidentDoesNotRewriteItsIdentity(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -180,11 +185,49 @@ func TestProcessNextEventRollsBackWhenOutboxInsertFails(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_3", "prometheus", "", "alert", base, "db", "prod", "high", "DB slow", "firing", []byte(`{}`)))
-	mock.ExpectQuery("(?s)SELECT i.id.*FOR UPDATE OF i SKIP LOCKED").
-		WithArgs("prod", base.Add(-15*time.Minute), base.Add(5*time.Minute), base.Add(-6*time.Hour)).
-		WillReturnRows(sqlmock.NewRows(candidateColumns()))
+	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "cond:db|db slow").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity"}).AddRow("inc_1", "investigating", "critical"))
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$5").
+		WithArgs("investigating", base, "high", base, "inc_1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO incident_events").
+		WithArgs("inc_1", "evt_3", "same_condition", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_3", 1, "extended_incident", "inc_1", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	requestKey := investigationRequestKey("inc_1", "evt_3")
+	mock.ExpectExec("INSERT INTO investigation_outbox").
+		WithArgs(outboxID(requestKey), "inc_1", 1, requestKey, base, "incident_created", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	c := &Correlator{db: db, now: func() time.Time { return base }}
+	if _, created, err := c.processNextEvent(context.Background()); err != nil || created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessNextEventRollsBackWhenOutboxInsertFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_4", "prometheus", "", "alert", base, "db", "prod", "high", "DB slow", "firing", []byte(`{}`)))
+	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec("INSERT INTO incidents").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO investigation_outbox").WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
@@ -239,36 +282,4 @@ func TestClaimNoEventCommitsEmptyTransaction(t *testing.T) {
 
 func eventColumns() []string {
 	return []string{"id", "source", "source_event_id", "type", "occurred_at", "service", "environment", "severity", "title", "status", "labels"}
-}
-
-func candidateColumns() []string {
-	return []string{"id", "title", "status", "started_at", "last_event_at", "resolved_at", "severity", "environment", "affected_services", "created_at", "service", "source", "source_event_id", "labels"}
-}
-
-// TestTitleIdentifiesAlertsWithoutAService pins the correlation identity for
-// Grafana's default alerting payload, which names no service at all. Grouping
-// used to fall back on the literal "grafana" service; now the alert's own name
-// carries the identity, so repeated fires continue the same incident instead
-// of opening a new one each time.
-func TestTitleIdentifiesAlertsWithoutAService(t *testing.T) {
-	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	event := models.Event{
-		Timestamp:   base,
-		Title:       "Kube Job Failed",
-		Environment: "prod",
-		Labels:      map[string]string{"alertname": "Kube Job Failed"},
-	}
-	candidates := []incidentCandidate{
-		{ID: "inc_other_rule", Title: "Kube Node Not Ready", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod"},
-		{ID: "inc_same_rule", Title: "Kube Job Failed", Status: "open", LastEventAt: base.Add(-time.Minute), StartedAt: base.Add(-time.Hour), CreatedAt: base.Add(-2 * time.Hour), Environment: "prod"},
-	}
-
-	got, score, ok := selectCandidate(event, candidates)
-	if !ok || got.ID != "inc_same_rule" || score != 50 {
-		t.Fatalf("selected %s score %d ok %v, want inc_same_rule score 50", got.ID, score, ok)
-	}
-
-	if !acceptedResolution(event, got) {
-		t.Fatal("same alert name should authorize resolution")
-	}
 }

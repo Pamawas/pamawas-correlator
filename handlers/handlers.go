@@ -20,10 +20,10 @@ import (
 
 // Handler holds dependencies for HTTP handlers
 type Handler struct {
-	correlator    *service.Correlator
-	cfg           config.Config
-	metrics       *metrics.Metrics
-	db            *sql.DB
+	correlator      *service.Correlator
+	cfg             config.Config
+	metrics         *metrics.Metrics
+	db              *sql.DB
 	investigatorURL string
 }
 
@@ -44,10 +44,10 @@ func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics, investigatorU
 	})
 
 	return &Handler{
-		correlator:    correlator,
-		cfg:           cfg,
-		metrics:       m,
-		db:            db,
+		correlator:      correlator,
+		cfg:             cfg,
+		metrics:         m,
+		db:              db,
 		investigatorURL: investigatorURL,
 	}
 }
@@ -89,14 +89,14 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(models.HealthResponse{
-		Status:             status,
-		Timestamp:          time.Now().UTC(),
-		LastRun:            lastRun,
-		Running:            running,
-		TimeWindow:         h.cfg.TimeWindow.String(),
-		Version:            "1.0.0",
+		Status:              status,
+		Timestamp:           time.Now().UTC(),
+		LastRun:             lastRun,
+		Running:             running,
+		TimeWindow:          h.cfg.TimeWindow.String(),
+		Version:             "1.0.0",
 		CircuitBreakerState: circuitState,
-		Errors:             errors,
+		Errors:              errors,
 	}); err != nil {
 		log.Error().Err(err).Msg("Failed to encode health response")
 	}

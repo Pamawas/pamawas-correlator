@@ -9,13 +9,13 @@ import (
 
 type Config struct {
 	ServiceToken string
-	DatabaseURL string
-	Port        string
-	LogLevel    string
-	Environment string
-	TimeWindow  time.Duration
-	Interval    time.Duration
-	Mode        string
+	DatabaseURL  string
+	Port         string
+	LogLevel     string
+	Environment  string
+	TimeWindow   time.Duration
+	Interval     time.Duration
+	Mode         string
 
 	// Centralized circuit-breaker + retry-budget configuration (design review P2).
 	CircuitBreakerThreshold    int

@@ -15,6 +15,13 @@ type Metrics struct {
 	LastRunTimestamp       prometheus.Gauge
 	CorrelatorRunning      prometheus.Gauge
 
+	// UnlinkedEventsTotal counts events that described no open incident and so
+	// created none — resolutions whose firing never arrived, most likely. In
+	// steady state this should stay at zero: every resolution should link to
+	// the incident its firing opened. A rate above zero means events are being
+	// lost before correlation, which is a platform problem, not a normal case.
+	UnlinkedEventsTotal *prometheus.CounterVec
+
 	// Outbox metrics
 	OutboxDeliveredTotal   *prometheus.CounterVec
 	OutboxFailedTotal      *prometheus.CounterVec
@@ -86,6 +93,15 @@ func NewMetrics() *Metrics {
 				Name:      "running",
 				Help:      "Whether correlator is currently running (1) or not (0)",
 			},
+		),
+		UnlinkedEventsTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "pamawas",
+				Subsystem: "correlator",
+				Name:      "unlinked_events_total",
+				Help:      "Events that matched no open incident and created none, by event status",
+			},
+			[]string{"status"},
 		),
 
 		// Outbox metrics

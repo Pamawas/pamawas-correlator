@@ -105,4 +105,3 @@ func TestHandlers_MethodNotAllowed(t *testing.T) {
 		})
 	}
 }
-
