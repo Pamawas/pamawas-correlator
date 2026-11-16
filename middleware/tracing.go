@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -128,6 +129,11 @@ var probePaths = map[string]struct{}{
 }
 
 func isProbePath(path string) bool {
-	_, ok := probePaths[path]
+	// Compare without a trailing slash: a router that redirects /metrics to
+	// /metrics/ would otherwise make the redirect target a traced request.
+	if _, ok := probePaths[path]; ok {
+		return true
+	}
+	_, ok := probePaths[strings.TrimSuffix(path, "/")]
 	return ok
 }
