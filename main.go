@@ -135,6 +135,9 @@ func main() {
 	}, handler)
 	handler = middleware.LoggingMiddleware("pamawas-correlator", handler)
 	handler = middleware.ErrorLoggingMiddleware("pamawas-correlator", handler)
+	// Tracing is outermost so every request gets a span, and so the logging
+	// middleware below it can log the real trace and span IDs.
+	handler = middleware.TracingMiddleware("pamawas-correlator", handler)
 	// Service-to-service auth. Applied outermost of the loggers so a rejected
 	// request is still logged. /api/v1/trigger runs a correlation cycle on
 	// demand, so an unauthenticated caller could force that work at will.

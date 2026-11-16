@@ -16,12 +16,20 @@ func LoggingMiddleware(serviceName string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		// Generate or extract trace ID
-		traceID := r.Header.Get("X-Trace-ID")
+		// Prefer the real trace context. TracingMiddleware runs before this and
+		// puts a live span in the request context, so these IDs are the ones
+		// Tempo can be searched by. The header fallback exists only for the case
+		// where tracing is disabled or this middleware runs standalone.
+		traceID, spanID := TraceIDs(r.Context())
+		if traceID == "" {
+			traceID = r.Header.Get("X-Trace-ID")
+		}
 		if traceID == "" {
 			traceID = uuid.New().String()[:8]
 		}
-		spanID := uuid.New().String()[:8]
+		if spanID == "" {
+			spanID = uuid.New().String()[:8]
+		}
 
 		// Create logger with context fields
 		logger := log.With().
@@ -58,7 +66,13 @@ func ErrorLoggingMiddleware(serviceName string, next http.Handler) http.Handler 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				traceID := r.Header.Get("X-Trace-ID")
+				// The real span context, same as the access log. A panic
+				// logged without the trace it happened in cannot be found in
+				// Tempo, which is exactly when it matters most.
+				traceID, spanID := TraceIDs(r.Context())
+				if traceID == "" {
+					traceID = r.Header.Get("X-Trace-ID")
+				}
 				if traceID == "" {
 					traceID = "unknown"
 				}
@@ -67,6 +81,7 @@ func ErrorLoggingMiddleware(serviceName string, next http.Handler) http.Handler 
 					Str("service", serviceName).
 					Str("component", "http").
 					Str("trace_id", traceID).
+					Str("span_id", spanID).
 					Str("method", r.Method).
 					Str("path", r.URL.Path).
 					Interface("error", err).

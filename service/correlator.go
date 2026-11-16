@@ -17,6 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Pamawas/pamawas-correlator/metrics"
 	"github.com/Pamawas/pamawas-correlator/models"
@@ -722,6 +726,21 @@ func scanOutboxRows(rows *sql.Rows) ([]outboxItem, error) {
 // calls the investigator API outside of any transaction, and applies the response
 // status to the outbox record in its own short transaction.
 func (c *Correlator) processOutboxItem(item outboxItem) error {
+	// The outbox worker is a background loop with no inbound request to inherit
+	// a trace from, so it starts one here. Without this, every investigation
+	// the correlator dispatches is invisible in Tempo even though the HTTP
+	// request that carries it is a normal, traceable call.
+	ctx, span := otel.Tracer("pamawas-correlator").Start(
+		c.ctx,
+		"outbox.deliver_investigation_request",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("pamawas.incident_id", item.incidentID),
+			attribute.Int("pamawas.outbox_attempts", item.attempts),
+		),
+	)
+	defer span.End()
+
 	// If the circuit breaker is open, skip the HTTP call and retry later —
 	// unless the retry budget is already exhausted, in which case the row is
 	// dead-lettered instead of looping forever behind the breaker.
@@ -743,10 +762,13 @@ func (c *Correlator) processOutboxItem(item outboxItem) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.investigatorURL+"/api/v1/investigations", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.investigatorURL+"/api/v1/investigations", bytes.NewReader(jsonBody))
 	if err != nil {
 		return err
 	}
+	// Carry the trace so the investigator's span joins this one instead of
+	// starting a second, unrelated trace.
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	req.Header.Set("Content-Type", "application/json")
 	if c.serviceToken != "" {
 		req.Header.Set("X-Service-Token", c.serviceToken)
