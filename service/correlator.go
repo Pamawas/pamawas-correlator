@@ -168,6 +168,10 @@ type Correlator struct {
 	// outboxMaxAttempts the row is copied to investigation_outbox_dead_letter
 	// and marked failed_terminal (no further retries).
 	outboxMaxAttempts int
+
+	// Silence after which an open incident is treated as orphaned. See
+	// reconcileStaleIncidents.
+	incidentStaleAfter time.Duration
 }
 
 // CorrelatorConfig carries the constructor parameters for NewCorrelator.
@@ -184,6 +188,9 @@ type CorrelatorConfig struct {
 	CircuitBreakerThreshold int
 	CircuitBreakerReset     time.Duration
 	OutboxMaxAttempts       int
+	// How long an open incident may go without a new event before it is closed
+	// as orphaned. Zero disables the sweep.
+	IncidentStaleAfter time.Duration
 }
 
 func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
@@ -204,10 +211,11 @@ func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		circuitBreaker:    newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
-		cycleTimeout:      defaultCycleTimeout,
-		shutdownTimeout:   defaultShutdownTimeout,
-		outboxMaxAttempts: cfg.OutboxMaxAttempts,
+		circuitBreaker:     newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
+		cycleTimeout:       defaultCycleTimeout,
+		shutdownTimeout:    defaultShutdownTimeout,
+		outboxMaxAttempts:  cfg.OutboxMaxAttempts,
+		incidentStaleAfter: cfg.IncidentStaleAfter,
 	}
 }
 
@@ -269,6 +277,14 @@ func (c *Correlator) Correlate() error {
 			created++
 		}
 	}
+	// Close incidents that stopped being reported before recording the cycle as
+	// done, so a report generated straight after sees the reconciled state.
+	if closed, err := c.reconcileStaleIncidents(cycleCtx); err != nil {
+		log.Error().Err(err).Msg("Failed to reconcile stale incidents")
+	} else if closed > 0 {
+		log.Info().Int("count", closed).Msg("Reconciled stale incidents this cycle")
+	}
+
 	c.mu.Lock()
 	c.lastRun = c.now()
 	c.mu.Unlock()
@@ -280,6 +296,72 @@ func (c *Correlator) Correlate() error {
 		c.metrics.CorrelationCyclesTotal.WithLabelValues("success").Inc()
 	}
 	return nil
+}
+
+// reconcileStaleIncidents closes open incidents that have gone silent.
+//
+// An incident is open because a firing event said so, and it closes when the
+// resolution arrives. If the resolution never arrives — the webhook was
+// dropped, the rule was deleted, the sender was restarted — the incident stays
+// open forever, and every report keeps saying "still down" about a target that
+// recovered hours ago. Production had four such incidents, the oldest silent
+// for 13 hours, all against targets that were `up=1` when checked.
+//
+// Silence is a real signal here because an alerting backend re-notifies a
+// firing alert periodically (Grafana's default repeat interval is 4h). A
+// condition that is still failing refreshes `last_event_at` within that window,
+// so anything silent past INCIDENT_STALE_AFTER is no longer being reported.
+//
+// The incident is closed as `resolved` with `resolved_at` set to its own last
+// event, not to now: the condition stopped being observed at that moment, and
+// claiming it recovered later would overstate the downtime. A warning names
+// every incident closed this way, because an unlinked resolution is a gap in
+// the pipeline worth knowing about.
+func (c *Correlator) reconcileStaleIncidents(ctx context.Context) (int, error) {
+	if c.incidentStaleAfter <= 0 {
+		return 0, nil
+	}
+	cutoff := c.now().Add(-c.incidentStaleAfter)
+
+	rows, err := c.db.QueryContext(ctx, `
+		UPDATE incidents
+		SET status = 'resolved',
+		    resolved_at = last_event_at,
+		    updated_at = now()
+		WHERE status IN ('open','investigating')
+		  AND last_event_at < $1
+		RETURNING id, identity_key, last_event_at`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Failed to close stale incident rows")
+		}
+	}()
+
+	closed := 0
+	for rows.Next() {
+		var id, identity string
+		var lastEvent time.Time
+		if scanErr := rows.Scan(&id, &identity, &lastEvent); scanErr != nil {
+			return closed, scanErr
+		}
+		closed++
+		log.Warn().
+			Str("incident_id", id).
+			Str("identity", identity).
+			Time("last_event_at", lastEvent).
+			Dur("silent_for", c.now().Sub(lastEvent)).
+			Msg("Closed an incident that stopped being reported; no resolution event arrived")
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return closed, rowsErr
+	}
+	if closed > 0 && c.metrics != nil {
+		c.metrics.UnlinkedEventsTotal.WithLabelValues("stale_incident").Add(float64(closed))
+	}
+	return closed, nil
 }
 
 func (c *Correlator) processNextEvent(ctx context.Context) (processed, created bool, err error) {

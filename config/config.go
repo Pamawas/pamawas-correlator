@@ -26,6 +26,14 @@ type Config struct {
 	// /healthz, /ready and /metrics are exempt.
 	RateLimitRPS   float64
 	RateLimitBurst int
+
+	// How long an open incident may go without a new event before it is closed
+	// as orphaned. Alerting backends re-notify a firing alert periodically
+	// (Grafana's default repeat interval is 4h), so silence past this window
+	// means the condition is no longer being reported — the resolution was
+	// dropped, or the rule was deleted. Without this, such an incident stays
+	// open forever and every report says "still down" about a recovered target.
+	IncidentStaleAfter time.Duration
 }
 
 func Load() Config {
@@ -74,6 +82,9 @@ func Load() Config {
 	if err := v.BindEnv("rate_limit_rps", "RATE_LIMIT_RPS"); err != nil {
 		panic(fmt.Sprintf("failed to bind RATE_LIMIT_RPS env: %v", err))
 	}
+	if err := v.BindEnv("incident_stale_after", "INCIDENT_STALE_AFTER"); err != nil {
+		panic(fmt.Sprintf("failed to bind INCIDENT_STALE_AFTER env: %v", err))
+	}
 	if err := v.BindEnv("rate_limit_burst", "RATE_LIMIT_BURST"); err != nil {
 		panic(fmt.Sprintf("failed to bind RATE_LIMIT_BURST env: %v", err))
 	}
@@ -90,6 +101,7 @@ func Load() Config {
 	v.SetDefault("outbox_max_attempts", 5)
 	v.SetDefault("rate_limit_rps", 10)
 	v.SetDefault("rate_limit_burst", 20)
+	v.SetDefault("incident_stale_after", "6h")
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -109,6 +121,10 @@ func Load() Config {
 	if err != nil {
 		panic(fmt.Sprintf("invalid circuit_breaker_reset_timeout: %v", err))
 	}
+	incidentStaleAfter, err := time.ParseDuration(v.GetString("incident_stale_after"))
+	if err != nil {
+		panic(fmt.Sprintf("invalid incident_stale_after: %v", err))
+	}
 
 	cfg := Config{
 		ServiceToken:               v.GetString("service_token"),
@@ -124,6 +140,7 @@ func Load() Config {
 		OutboxMaxAttempts:          v.GetInt("outbox_max_attempts"),
 		RateLimitRPS:               v.GetFloat64("rate_limit_rps"),
 		RateLimitBurst:             v.GetInt("rate_limit_burst"),
+		IncidentStaleAfter:         incidentStaleAfter,
 	}
 
 	if err := cfg.Validate(); err != nil {

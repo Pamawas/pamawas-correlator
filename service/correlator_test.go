@@ -283,3 +283,57 @@ func TestClaimNoEventCommitsEmptyTransaction(t *testing.T) {
 func eventColumns() []string {
 	return []string{"id", "source", "source_event_id", "type", "occurred_at", "service", "environment", "severity", "title", "status", "labels"}
 }
+
+// TestReconcileStaleIncidentsClosesSilentIncidents covers the orphan that stayed
+// open for 13 hours.
+//
+// An incident is open because a firing event said so; it closes when the
+// resolution arrives. If that resolution never arrives — dropped webhook,
+// deleted rule, restarted sender — the incident stays open forever and every
+// report keeps saying "still down" about a target that recovered.
+func TestReconcileStaleIncidentsClosesSilentIncidents(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Logf("close: %v", closeErr)
+		}
+	}()
+
+	c := NewCorrelator(db, CorrelatorConfig{
+		TimeWindow:         time.Minute,
+		Interval:           time.Minute,
+		IncidentStaleAfter: 6 * time.Hour,
+	})
+	c.now = func() time.Time { return time.Date(2026, 11, 16, 15, 0, 0, 0, time.UTC) }
+
+	lastEvent := time.Date(2026, 11, 16, 2, 0, 0, 0, time.UTC)
+	rows := sqlmock.NewRows([]string{"id", "identity_key", "last_event_at"}).
+		AddRow("inc_orphan", "fp:deadbeef", lastEvent)
+	mock.ExpectQuery("UPDATE incidents").
+		WithArgs(time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)).
+		WillReturnRows(rows)
+	mock.ExpectClose()
+
+	closed, err := c.reconcileStaleIncidents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1", closed)
+	}
+}
+
+// TestReconcileStaleIncidentsIsDisabledByZero keeps the sweep opt-out-able.
+func TestReconcileStaleIncidentsIsDisabledByZero(t *testing.T) {
+	c := NewCorrelator(nil, CorrelatorConfig{IncidentStaleAfter: 0})
+	closed, err := c.reconcileStaleIncidents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0", closed)
+	}
+}
