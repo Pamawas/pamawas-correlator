@@ -520,10 +520,6 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 		if err != nil {
 			return "", "", false, err
 		}
-
-		// Reset stale verification state when an event arrives for an open incident
-		// (stale-incident-verification.md §5.3).
-		_, _ = tx.ExecContext(ctx, `DELETE FROM stale_verifications WHERE incident_id = $1`, incidentID)
 	}
 	return incidentID, reason, created, nil
 }
