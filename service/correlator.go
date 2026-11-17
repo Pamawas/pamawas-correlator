@@ -536,13 +536,6 @@ func initialAffectedServices(event models.Event) []string {
 	return []string{}
 }
 
-func nonEmpty(s string) []string {
-	if s == "" {
-		return []string{}
-	}
-	return []string{s}
-}
-
 func investigationRequestKey(incidentID, eventID string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", incidentID, eventID, correlationVersion)))
 	return hex.EncodeToString(sum[:])
