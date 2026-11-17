@@ -168,10 +168,6 @@ type Correlator struct {
 	// outboxMaxAttempts the row is copied to investigation_outbox_dead_letter
 	// and marked failed_terminal (no further retries).
 	outboxMaxAttempts int
-
-	// Stale-incident verification wiring. See stale-incident-verification.md.
-	reporterURL        string
-	incidentStaleAfter time.Duration
 }
 
 // CorrelatorConfig carries the constructor parameters for NewCorrelator.
@@ -188,10 +184,6 @@ type CorrelatorConfig struct {
 	CircuitBreakerThreshold int
 	CircuitBreakerReset     time.Duration
 	OutboxMaxAttempts       int
-	ReporterURL             string
-	// Silence after which an open incident is verified (see
-	// stale-incident-verification.md). Zero or empty disables the sweep.
-	IncidentStaleAfter time.Duration
 }
 
 func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
@@ -212,12 +204,10 @@ func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		circuitBreaker:     newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
-		cycleTimeout:       defaultCycleTimeout,
-		shutdownTimeout:    defaultShutdownTimeout,
-		outboxMaxAttempts:  cfg.OutboxMaxAttempts,
-		reporterURL:        cfg.ReporterURL,
-		incidentStaleAfter: cfg.IncidentStaleAfter,
+		circuitBreaker:    newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
+		cycleTimeout:      defaultCycleTimeout,
+		shutdownTimeout:   defaultShutdownTimeout,
+		outboxMaxAttempts: cfg.OutboxMaxAttempts,
 	}
 }
 
@@ -280,16 +270,6 @@ func (c *Correlator) Correlate() error {
 		}
 	}
 
-	// Verify stale-open incidents before recording the cycle as done. An
-	// incident silent past INCIDENT_STALE_AFTER is asked whether it is actually
-	// still down; only a verification that confirms recovery closes it. See
-	// stale-incident-verification.md.
-	if c.incidentStaleAfter > 0 && c.investigatorURL != "" {
-		if err := c.verifyStaleIncidents(cycleCtx); err != nil {
-			log.Error().Err(err).Msg("Failed to verify stale incidents")
-		}
-	}
-
 	c.mu.Lock()
 	c.lastRun = c.now()
 	c.mu.Unlock()
@@ -301,226 +281,6 @@ func (c *Correlator) Correlate() error {
 		c.metrics.CorrelationCyclesTotal.WithLabelValues("success").Inc()
 	}
 	return nil
-}
-
-// verifyStaleIncidents asks the investigator whether silent open incidents are
-// actually still down, and acts on the verdict.
-//
-// An incident is open because a firing event said so and stays that way until
-// the resolution arrives. If that resolution is lost — a dropped webhook, a
-// restarted sender, a deleted rule — the incident stays open forever and every
-// report keeps saying "still down" about a target that recovered. See
-// stale-incident-verification.md.
-//
-// Alerting backends re-notify a firing alert periodically (Grafana's default
-// repeat interval is 4h), so an incident silent past INCIDENT_STALE_AFTER is no
-// longer being reported. Rather than blind-close it, this verifies:
-//
-//	recovered  -> close the incident (resolved_at = last_event_at), then notify.
-//	still_down -> keep it open, then notify why.
-//
-// The verification runs synchronously because the close decision needs its
-// answer now. A failed verification is treated as still_down: the incident is
-// never closed on the absence of proof it recovered.
-func (c *Correlator) verifyStaleIncidents(ctx context.Context) error {
-	cutoff := c.now().Add(-c.incidentStaleAfter)
-
-	rows, err := c.db.QueryContext(ctx, `
-		SELECT id, title, severity, environment, affected_services, last_event_at
-		FROM incidents
-		WHERE status IN ('open','investigating')
-		  AND last_event_at < $1
-		LIMIT 10`, cutoff)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close stale incident rows")
-		}
-	}()
-
-	for rows.Next() {
-		var inc struct {
-			id               string
-			title            string
-			severity         string
-			environment      string
-			affectedServices []string
-			lastEventAt      time.Time
-		}
-		var affected []byte
-		if scanErr := rows.Scan(&inc.id, &inc.title, &inc.severity, &inc.environment, &affected, &inc.lastEventAt); scanErr != nil {
-			return scanErr
-		}
-		if unmarshalErr := json.Unmarshal(affected, &inc.affectedServices); unmarshalErr != nil {
-			inc.affectedServices = nil
-		}
-		if err := c.verifyOneIncident(ctx, inc); err != nil {
-			log.Error().Err(err).Str("incident_id", inc.id).Msg("Failed to verify stale incident")
-		}
-	}
-	return rows.Err()
-}
-
-// verifyOneIncident runs one verification and applies its verdict.
-func (c *Correlator) verifyOneIncident(ctx context.Context, inc struct {
-	id               string
-	title            string
-	severity         string
-	environment      string
-	affectedServices []string
-	lastEventAt      time.Time
-}) error {
-	verdict, reason, findings, err := c.callInvestigatorVerify(ctx, inc.id)
-	if err != nil {
-		// A failed verification must not close the incident.
-		log.Error().Err(err).Str("incident_id", inc.id).Msg("Verification call failed; keeping incident open")
-		if notifyErr := c.notifyVerifyReport(ctx, inc, "still_down", "Verification failed: "+err.Error(), nil); notifyErr != nil {
-			log.Error().Err(notifyErr).Str("incident_id", inc.id).Msg("Failed to notify about failed verification")
-		}
-		return err
-	}
-
-	if c.metrics != nil {
-		c.metrics.StaleVerifiedTotal.WithLabelValues(verdict).Inc()
-	}
-	log.Info().Str("incident_id", inc.id).Str("verdict", verdict).Msg("Verified stale incident")
-
-	if verdict == "recovered" {
-		// The evidence says the condition recovered. Close the incident dated
-		// at its last event, not now: it stopped being observed then, and
-		// claiming it recovered later would overstate the downtime.
-		if _, err := c.db.ExecContext(ctx, `
-			UPDATE incidents
-			SET status = 'resolved', resolved_at = last_event_at, updated_at = now()
-			WHERE id = $1 AND status IN ('open','investigating')
-		`, inc.id); err != nil {
-			return err
-		}
-		log.Warn().Str("incident_id", inc.id).Msg("Closed stale incident after verification confirmed recovery")
-	}
-
-	return c.notifyVerifyReport(ctx, inc, verdict, reason, findings)
-}
-
-// callInvestigatorVerify POSTs the incident to the investigator's verify
-// endpoint and returns the verdict.
-func (c *Correlator) callInvestigatorVerify(ctx context.Context, incidentID string) (verdict, reason string, findings []map[string]interface{}, err error) {
-	ctx, span := otel.Tracer("pamawas-correlator").Start(
-		ctx,
-		"stale.verify_incident",
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("pamawas.incident_id", incidentID)),
-	)
-	defer span.End()
-
-	body, err := json.Marshal(map[string]interface{}{
-		"contract_version": 1,
-		"incident_id":      incidentID,
-	})
-	if err != nil {
-		return "", "", nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.investigatorURL+"/api/v1/verify", bytes.NewReader(body))
-	if err != nil {
-		return "", "", nil, err
-	}
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-	req.Header.Set("Content-Type", "application/json")
-	if c.serviceToken != "" {
-		req.Header.Set("X-Service-Token", c.serviceToken)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", "", nil, err
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close verify response body")
-		}
-	}()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", nil, fmt.Errorf("investigator verify returned %d", resp.StatusCode)
-	}
-
-	var payload struct {
-		Data struct {
-			Verdict  string                   `json:"verdict"`
-			Reason   string                   `json:"reason"`
-			Findings []map[string]interface{} `json:"findings"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", "", nil, err
-	}
-	if payload.Data.Verdict != "recovered" && payload.Data.Verdict != "still_down" {
-		return "still_down", payload.Data.Reason, payload.Data.Findings, nil
-	}
-	return payload.Data.Verdict, payload.Data.Reason, payload.Data.Findings, nil
-}
-
-// notifyVerifyReport sends the verification outcome card to the reporter.
-func (c *Correlator) notifyVerifyReport(ctx context.Context, inc struct {
-	id               string
-	title            string
-	severity         string
-	environment      string
-	affectedServices []string
-	lastEventAt      time.Time
-}, verdict, reason string, findings []map[string]interface{}) error {
-	if c.reporterURL == "" {
-		return nil
-	}
-
-	body, err := json.Marshal(map[string]interface{}{
-		"contract_version": 1,
-		"incident_id":      inc.id,
-		"verdict":          verdict,
-		"title":            inc.title,
-		"severity":         inc.severity,
-		"environment":      inc.environment,
-		"target":           firstAffected(inc.affectedServices),
-		"reason":           reason,
-		"findings":         findings,
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.reporterURL+"/api/v1/verify-reports", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-	req.Header.Set("Content-Type", "application/json")
-	if c.serviceToken != "" {
-		req.Header.Set("X-Service-Token", c.serviceToken)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Failed to close verify-report response body")
-		}
-	}()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("reporter verify-report returned %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// firstAffected returns the first affected service, or "" when none is set.
-func firstAffected(services []string) string {
-	if len(services) == 0 {
-		return ""
-	}
-	return services[0]
 }
 
 func (c *Correlator) processNextEvent(ctx context.Context) (processed, created bool, err error) {
@@ -760,6 +520,10 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 		if err != nil {
 			return "", "", false, err
 		}
+
+		// Reset stale verification state when an event arrives for an open incident
+		// (stale-incident-verification.md §5.3).
+		_, _ = tx.ExecContext(ctx, `DELETE FROM stale_verifications WHERE incident_id = $1`, incidentID)
 	}
 	return incidentID, reason, created, nil
 }
