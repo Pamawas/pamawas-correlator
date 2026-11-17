@@ -283,3 +283,29 @@ func TestClaimNoEventCommitsEmptyTransaction(t *testing.T) {
 func eventColumns() []string {
 	return []string{"id", "source", "source_event_id", "type", "occurred_at", "service", "environment", "severity", "title", "status", "labels"}
 }
+
+func TestInitialAffectedServices(t *testing.T) {
+	// Explicit service wins
+	e1 := models.Event{Service: "my-svc", Labels: map[string]string{"pod": "my-pod"}}
+	if got := initialAffectedServices(e1); len(got) != 1 || got[0] != "my-svc" {
+		t.Fatalf("expected [my-svc], got %v", got)
+	}
+
+	// Falls back to pod label when service is empty
+	e2 := models.Event{Service: "", Labels: map[string]string{"pod": "my-pod"}}
+	if got := initialAffectedServices(e2); len(got) != 1 || got[0] != "my-pod" {
+		t.Fatalf("expected [my-pod], got %v", got)
+	}
+
+	// Falls back to instance
+	e3 := models.Event{Service: "", Labels: map[string]string{"instance": "10.0.0.1"}}
+	if got := initialAffectedServices(e3); len(got) != 1 || got[0] != "10.0.0.1" {
+		t.Fatalf("expected [10.0.0.1], got %v", got)
+	}
+
+	// Empty when no candidate labels
+	e4 := models.Event{Service: "", Labels: map[string]string{}}
+	if got := initialAffectedServices(e4); len(got) != 0 {
+		t.Fatalf("expected [], got %v", got)
+	}
+}

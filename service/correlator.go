@@ -497,7 +497,7 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 			INSERT INTO incidents
 				(id,title,identity_key,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at)
 			VALUES ($1,$2,$3,'open',$4,$4,NULL,$5,$6,$7,$8,$9,$10,$10)
-		`, incidentID, event.Title, identity, event.Timestamp, event.Severity, event.Environment, pq.Array(nonEmpty(event.Service)), correlationPolicy, correlationVersion, now)
+		`, incidentID, event.Title, identity, event.Timestamp, event.Severity, event.Environment, pq.Array(initialAffectedServices(event)), correlationPolicy, correlationVersion, now)
 		if err != nil {
 			return "", "", false, err
 		}
@@ -522,6 +522,18 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 		}
 	}
 	return incidentID, reason, created, nil
+}
+
+func initialAffectedServices(event models.Event) []string {
+	if event.Service != "" {
+		return []string{event.Service}
+	}
+	for _, key := range []string{"pod", "instance", "target", "container", "node"} {
+		if val, ok := event.Labels[key]; ok && val != "" {
+			return []string{val}
+		}
+	}
+	return []string{}
 }
 
 func nonEmpty(s string) []string {
