@@ -104,7 +104,6 @@ func main() {
 		CircuitBreakerThreshold: cfg.CircuitBreakerThreshold,
 		CircuitBreakerReset:     cfg.CircuitBreakerResetTimeout,
 		OutboxMaxAttempts:       cfg.OutboxMaxAttempts,
-		IncidentStaleAfter:      cfg.IncidentStaleAfter,
 	})
 
 	// Initialize handlers
