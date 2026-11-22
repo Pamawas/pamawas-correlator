@@ -53,12 +53,13 @@ const (
 	decisionIgnored = "ignored"
 )
 
-// incidentCandidate is an open incident that may receive the event being
-// processed. Only the columns the mutation needs are loaded.
+// incidentCandidate is an open or recently resolved incident that may receive the event being
+// processed.
 type incidentCandidate struct {
-	ID       string
-	Status   string
-	Severity string
+	ID               string
+	Status           string
+	Severity         string
+	AffectedServices []string
 }
 
 // eventIdentity returns the condition an event describes.
@@ -78,6 +79,68 @@ func eventIdentity(event models.Event) string {
 		return "fp:" + fingerprint
 	}
 	return "cond:" + strings.ToLower(strings.TrimSpace(event.Service)) + "|" + strings.ToLower(strings.TrimSpace(event.Title))
+}
+
+// severityRank orders severities monotonically so that incidents only escalate.
+func severityRank(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "critical":
+		return 4
+	case "high":
+		return 3
+	case "warning", "medium":
+		return 2
+	case "low", "info":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// maxSeverity returns the higher severity between current and incoming.
+func maxSeverity(current, incoming string) string {
+	currRank := severityRank(current)
+	incRank := severityRank(incoming)
+	if incRank > currRank {
+		trimmed := strings.ToLower(strings.TrimSpace(incoming))
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	if current != "" {
+		return strings.ToLower(strings.TrimSpace(current))
+	}
+	return strings.ToLower(strings.TrimSpace(incoming))
+}
+
+// mergeAffectedServices combines existing and incoming affected services,
+// preserving order, trimming whitespace, and discarding duplicates case-insensitively.
+func mergeAffectedServices(existing, incoming []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	res := make([]string, 0, len(existing)+len(incoming))
+	for _, s := range existing {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if _, ok := seen[lower]; !ok {
+			seen[lower] = struct{}{}
+			res = append(res, trimmed)
+		}
+	}
+	for _, s := range incoming {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if _, ok := seen[lower]; !ok {
+			seen[lower] = struct{}{}
+			res = append(res, trimmed)
+		}
+	}
+	return res
 }
 
 // CircuitState is the typed state of the circuit breaker. Replaces the
@@ -168,6 +231,8 @@ type Correlator struct {
 	// outboxMaxAttempts the row is copied to investigation_outbox_dead_letter
 	// and marked failed_terminal (no further retries).
 	outboxMaxAttempts int
+
+	flappingCooldownWindow time.Duration
 }
 
 // CorrelatorConfig carries the constructor parameters for NewCorrelator.
@@ -184,6 +249,7 @@ type CorrelatorConfig struct {
 	CircuitBreakerThreshold int
 	CircuitBreakerReset     time.Duration
 	OutboxMaxAttempts       int
+	FlappingCooldownWindow  time.Duration
 }
 
 func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
@@ -204,10 +270,11 @@ func NewCorrelator(db *sql.DB, cfg CorrelatorConfig) *Correlator {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		circuitBreaker:    newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
-		cycleTimeout:      defaultCycleTimeout,
-		shutdownTimeout:   defaultShutdownTimeout,
-		outboxMaxAttempts: cfg.OutboxMaxAttempts,
+		circuitBreaker:         newCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset),
+		cycleTimeout:           defaultCycleTimeout,
+		shutdownTimeout:        defaultShutdownTimeout,
+		outboxMaxAttempts:      cfg.OutboxMaxAttempts,
+		flappingCooldownWindow: cfg.FlappingCooldownWindow,
 	}
 }
 
@@ -311,7 +378,7 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	}
 
 	identity := eventIdentity(event)
-	candidate, matched, err := loadOpenIncidentByIdentity(ctx, tx, event.Environment, identity)
+	candidate, matched, err := c.loadOpenIncidentByIdentity(ctx, tx, event.Environment, identity, event.Timestamp, event.Status == "firing")
 	if err != nil {
 		return false, false, err
 	}
@@ -352,7 +419,7 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 		return true, false, nil
 	}
 
-	incidentID, reason, created, mutationErr := c.applyIncidentMutation(ctx, tx, event, identity, candidate, matched, now)
+	incidentID, reason, created, severityEscalated, mutationErr := c.applyIncidentMutation(ctx, tx, event, identity, candidate, matched, now)
 	if mutationErr != nil {
 		return false, false, mutationErr
 	}
@@ -364,15 +431,15 @@ func (c *Correlator) processNextEvent(ctx context.Context) (processed, created b
 	if err := recordCorrelationDecision(ctx, tx, event.ID, decisionForCorrelationReason(reason), incidentID, now); err != nil {
 		return false, false, err
 	}
-	// Only dispatch an investigation for a newly created or extended incident.
-	// A resolution needs no investigation; it is handled by the reporter's
-	// resolve-notification flow.
-	//
-	// `reason` on the outbox row is the API-level investigation reason
-	// (schema CHECK allows only 'incident_created'/'incident_resolved'). The
-	// correlation reason lives on incident_events.correlation_reason and must
-	// not be written here.
-	if reason != "resolution_of_open_incident" {
+	// Dispatch an investigation outbox request when:
+	// 1. A new incident was created (created == true)
+	// 2. A resolved incident was reopened due to alert flapping (reason == "flapping_reopened")
+	// 3. The severity escalated (e.g. warning -> high/critical)
+	// Periodic scrape evaluations of an already-open incident without escalation are throttled
+	// to avoid duplicate outbox spam and investigator overload.
+	// Resolutions are handled by the reporter's notification flow, not investigation outbox.
+	shouldInvestigate := (created || reason == "flapping_reopened" || severityEscalated) && reason != "resolution_of_open_incident"
+	if shouldInvestigate {
 		key := investigationRequestKey(incidentID, event.ID)
 		_, execErr = tx.ExecContext(ctx, `INSERT INTO investigation_outbox (id,incident_id,contract_version,request_key_hash,status,attempts,next_attempt_at,reason,created_at,updated_at) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$7) ON CONFLICT (request_key_hash) DO NOTHING`, outboxID(key), incidentID, correlationVersion, key, now, outboxReasonIncidentCreated, now)
 		if execErr != nil {
@@ -412,32 +479,56 @@ func fetchPendingEvent(ctx context.Context, tx *sql.Tx) (models.Event, error) {
 	return event, nil
 }
 
-// loadOpenIncidentByIdentity finds the one open incident for a condition.
+// loadOpenIncidentByIdentity finds the open incident for a condition, or a recently
+// resolved incident within the flapping cooldown window if the incoming event is firing.
 //
-// There is at most one: migration 005 enforces
+// There is at most one open incident: migration 005 enforces
 // UNIQUE (environment, identity_key) WHERE status IN ('open','investigating').
-// That constraint is the real matcher — this query only has to look it up.
-// Resolved incidents are deliberately not candidates; an alert that fires
-// again after recovering is a new occurrence of the condition, and the
-// reporter's recurrence count is what tells the on-call engineer how often it
-// has happened.
-func loadOpenIncidentByIdentity(ctx context.Context, tx *sql.Tx, environment, identity string) (incidentCandidate, bool, error) {
+// When no open incident is found and flappingCooldownWindow is positive, recently resolved
+// incidents within the cooldown window are checked to prevent flapping alert storms.
+func (c *Correlator) loadOpenIncidentByIdentity(ctx context.Context, tx *sql.Tx, environment, identity string, eventTimestamp time.Time, isFiring bool) (incidentCandidate, bool, error) {
 	var candidate incidentCandidate
 	err := tx.QueryRowContext(ctx, `
-		SELECT id, status, severity
+		SELECT id, status, severity, COALESCE(affected_services, '{}')
 		FROM incidents
 		WHERE environment = $1
 		  AND identity_key = $2
 		  AND status IN ('open', 'investigating')
 		FOR UPDATE
-	`, environment, identity).Scan(&candidate.ID, &candidate.Status, &candidate.Severity)
-	if err == sql.ErrNoRows {
-		return incidentCandidate{}, false, nil
+	`, environment, identity).Scan(&candidate.ID, &candidate.Status, &candidate.Severity, pq.Array(&candidate.AffectedServices))
+	if err == nil {
+		return candidate, true, nil
 	}
-	if err != nil {
+	if err != sql.ErrNoRows {
 		return incidentCandidate{}, false, err
 	}
-	return candidate, true, nil
+
+	// If no open/investigating incident exists and this is a firing event,
+	// check whether a recently resolved incident exists within the flapping cooldown window.
+	// If so, re-open that incident instead of creating flapping churn.
+	if isFiring && c != nil && c.flappingCooldownWindow > 0 {
+		cutoff := eventTimestamp.Add(-c.flappingCooldownWindow)
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, status, severity, COALESCE(affected_services, '{}')
+			FROM incidents
+			WHERE environment = $1
+			  AND identity_key = $2
+			  AND status = 'resolved'
+			  AND resolved_at IS NOT NULL
+			  AND resolved_at >= $3
+			ORDER BY resolved_at DESC
+			LIMIT 1
+			FOR UPDATE
+		`, environment, identity, cutoff).Scan(&candidate.ID, &candidate.Status, &candidate.Severity, pq.Array(&candidate.AffectedServices))
+		if err == nil {
+			return candidate, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return incidentCandidate{}, false, err
+		}
+	}
+
+	return incidentCandidate{}, false, nil
 }
 
 // recordCorrelationDecision marks an event as processed and records what the
@@ -468,60 +559,70 @@ func decisionForCorrelationReason(reason string) string {
 	}
 }
 
-// applyIncidentMutation decides whether to INSERT a new incident or UPDATE an
-// existing matched candidate, then executes the appropriate statement.
-// Returns the resolved incident ID, correlation reason, whether a new incident
-// was created, and any execution error.
-// applyIncidentMutation opens an incident for a new condition, or extends the
-// open incident for an existing one.
+// applyIncidentMutation opens an incident for a new condition, extends an open
+// incident, resolves it, or re-opens a recently resolved incident on alert flapping.
 //
-// The incident's identity columns — title, identity_key, affected_services —
-// are written once, when the incident is opened, and never overwritten. They
-// describe the condition; a later event can only move the incident's status,
-// its last-seen time and its severity. Overwriting them is what let a RAM
-// incident turn into a "Monitoring Target Down" incident for another host.
-func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, event models.Event, identity string, candidate incidentCandidate, matched bool, now time.Time) (string, string, bool, error) {
+// Title and identity_key are stable and immutable once created.
+// Severity escalates monotonically (max of previous and current).
+// Affected services are aggregated dynamically, merging new targets without dropping previously known ones.
+func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, event models.Event, identity string, candidate incidentCandidate, matched bool, now time.Time) (string, string, bool, bool, error) {
 	reduction := event.Status == "resolved" && matched
+	reopening := matched && candidate.Status == "resolved" && event.Status == "firing"
 	reason := "new_incident"
 	if matched {
-		reason = "same_condition"
 		if reduction {
 			reason = "resolution_of_open_incident"
+		} else if reopening {
+			reason = "flapping_reopened"
+		} else {
+			reason = "same_condition"
 		}
 	}
-	var created bool
-	var incidentID string
+
+	var severityEscalated bool
+	if matched {
+		severityEscalated = severityRank(event.Severity) > severityRank(candidate.Severity)
+	}
+
 	if !matched {
-		incidentID = c.newIncidentID(event.Timestamp)
+		incidentID := c.newIncidentID(event.Timestamp)
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO incidents
 				(id,title,identity_key,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at)
 			VALUES ($1,$2,$3,'open',$4,$4,NULL,$5,$6,$7,$8,$9,$10,$10)
 		`, incidentID, event.Title, identity, event.Timestamp, event.Severity, event.Environment, pq.Array(initialAffectedServices(event)), correlationPolicy, correlationVersion, now)
 		if err != nil {
-			return "", "", false, err
+			return "", "", false, false, err
 		}
-		created = true
-	} else {
-		incidentID = candidate.ID
-		status := candidate.Status
-		if reduction {
-			status = "resolved"
-		}
-		_, err := tx.ExecContext(ctx, `
-			UPDATE incidents
-			SET status = $1,
-			    last_event_at = GREATEST(last_event_at, $2),
-			    resolved_at = CASE WHEN $1 = 'resolved' THEN GREATEST(COALESCE(resolved_at, $2), $2) ELSE NULL END,
-			    severity = $3,
-			    updated_at = $4
-			WHERE id = $5
-		`, status, event.Timestamp, event.Severity, now, incidentID)
-		if err != nil {
-			return "", "", false, err
-		}
+		return incidentID, reason, true, false, nil
 	}
-	return incidentID, reason, created, nil
+
+	incidentID := candidate.ID
+	status := candidate.Status
+	if reduction {
+		status = "resolved"
+	} else if reopening {
+		status = "open"
+	}
+
+	mergedServices := mergeAffectedServices(candidate.AffectedServices, initialAffectedServices(event))
+	escalatedSeverity := maxSeverity(candidate.Severity, event.Severity)
+
+	_, err := tx.ExecContext(ctx, `
+		UPDATE incidents
+		SET status = $1,
+		    last_event_at = GREATEST(last_event_at, $2),
+		    resolved_at = CASE WHEN $1 = 'resolved' THEN GREATEST(COALESCE(resolved_at, $2), $2) ELSE NULL END,
+		    severity = $3,
+		    affected_services = $4,
+		    updated_at = $5
+		WHERE id = $6
+	`, status, event.Timestamp, escalatedSeverity, pq.Array(mergedServices), now, incidentID)
+	if err != nil {
+		return "", "", false, false, err
+	}
+
+	return incidentID, reason, false, severityEscalated, nil
 }
 
 func initialAffectedServices(event models.Event) []string {

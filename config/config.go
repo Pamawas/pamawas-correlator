@@ -26,6 +26,10 @@ type Config struct {
 	// /healthz, /ready and /metrics are exempt.
 	RateLimitRPS   float64
 	RateLimitBurst int
+
+	// Window for re-opening recently resolved incidents on alert flapping
+	// rather than creating new incident churn.
+	FlappingCooldownWindow time.Duration
 }
 
 func Load() Config {
@@ -77,6 +81,9 @@ func Load() Config {
 	if err := v.BindEnv("rate_limit_burst", "RATE_LIMIT_BURST"); err != nil {
 		panic(fmt.Sprintf("failed to bind RATE_LIMIT_BURST env: %v", err))
 	}
+	if err := v.BindEnv("flapping_cooldown_window", "FLAPPING_COOLDOWN_WINDOW", "PAMAWAS_CORRELATOR_FLAPPING_COOLDOWN_WINDOW"); err != nil {
+		panic(fmt.Sprintf("failed to bind FLAPPING_COOLDOWN_WINDOW env: %v", err))
+	}
 
 	// Defaults
 	v.SetDefault("port", "8080")
@@ -90,6 +97,7 @@ func Load() Config {
 	v.SetDefault("outbox_max_attempts", 5)
 	v.SetDefault("rate_limit_rps", 10)
 	v.SetDefault("rate_limit_burst", 20)
+	v.SetDefault("flapping_cooldown_window", "15m")
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -109,6 +117,10 @@ func Load() Config {
 	if err != nil {
 		panic(fmt.Sprintf("invalid circuit_breaker_reset_timeout: %v", err))
 	}
+	flappingCooldownWindow, err := time.ParseDuration(v.GetString("flapping_cooldown_window"))
+	if err != nil {
+		panic(fmt.Sprintf("invalid flapping_cooldown_window: %v", err))
+	}
 
 	cfg := Config{
 		ServiceToken:               v.GetString("service_token"),
@@ -124,6 +136,7 @@ func Load() Config {
 		OutboxMaxAttempts:          v.GetInt("outbox_max_attempts"),
 		RateLimitRPS:               v.GetFloat64("rate_limit_rps"),
 		RateLimitBurst:             v.GetInt("rate_limit_burst"),
+		FlappingCooldownWindow:     flappingCooldownWindow,
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -159,6 +172,9 @@ func (c Config) Validate() error {
 	}
 	if c.RateLimitBurst < 1 {
 		return fmt.Errorf("rate_limit_burst must be >= 1")
+	}
+	if c.FlappingCooldownWindow < 0 {
+		return fmt.Errorf("flapping_cooldown_window must be non-negative")
 	}
 	return nil
 }

@@ -50,6 +50,7 @@ func main() {
 		Str("log_level", cfg.LogLevel).
 		Str("time_window", cfg.TimeWindow.String()).
 		Str("interval", cfg.Interval.String()).
+		Str("flapping_cooldown_window", cfg.FlappingCooldownWindow.String()).
 		Str("mode", cfg.Mode).
 		Msg("Starting pamawas-correlator")
 
@@ -104,6 +105,7 @@ func main() {
 		CircuitBreakerThreshold: cfg.CircuitBreakerThreshold,
 		CircuitBreakerReset:     cfg.CircuitBreakerResetTimeout,
 		OutboxMaxAttempts:       cfg.OutboxMaxAttempts,
+		FlappingCooldownWindow:  cfg.FlappingCooldownWindow,
 	})
 
 	// Initialize handlers

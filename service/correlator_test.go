@@ -69,11 +69,11 @@ func TestProcessNextEventExtendsAndResolvesOpenIncident(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_1", "grafana", "", "alert", base, "api", "prod", "high", "API latency", "resolved", labels))
-	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
 		WithArgs("prod", "fp:fp-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity"}).AddRow("inc_1", "open", "warning"))
-	mock.ExpectExec("UPDATE incidents").
-		WithArgs("resolved", base, "high", base, "inc_1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity", "affected_services"}).AddRow("inc_1", "open", "warning", `{"api"}`))
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$6").
+		WithArgs("resolved", base, "high", `{"api"}`, base, "inc_1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").
 		WithArgs("inc_1", "evt_1", "resolution_of_open_incident", 1, base).
@@ -104,7 +104,7 @@ func TestProcessNextEventCreatesIncidentAndOutbox(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_2", "prometheus", "", "alert", base, "db", "prod", "critical", "DB down", "firing", []byte(`{}`)))
-	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
 		WithArgs("prod", "cond:db|db down").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec("INSERT INTO incidents").
@@ -152,7 +152,7 @@ func TestResolutionWithoutOpenIncidentCreatesNoIncident(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_9", "grafana", "", "alert", base, "api", "prod", "high", "API latency", "resolved", labels))
-	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
 		WithArgs("prod", "fp:fp-orphan").
 		WillReturnError(sql.ErrNoRows)
 	// No INSERT INTO incidents, no INSERT INTO incident_events, no outbox.
@@ -173,7 +173,7 @@ func TestResolutionWithoutOpenIncidentCreatesNoIncident(t *testing.T) {
 
 // TestExtendingAnIncidentDoesNotRewriteItsIdentity guards the column that made
 // incidents drift: a later event may move status, last-seen time and severity,
-// but never title or affected_services.
+// but never title or identity_key.
 func TestExtendingAnIncidentDoesNotRewriteItsIdentity(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -185,11 +185,11 @@ func TestExtendingAnIncidentDoesNotRewriteItsIdentity(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_3", "prometheus", "", "alert", base, "db", "prod", "high", "DB slow", "firing", []byte(`{}`)))
-	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
 		WithArgs("prod", "cond:db|db slow").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity"}).AddRow("inc_1", "investigating", "critical"))
-	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$5").
-		WithArgs("investigating", base, "high", base, "inc_1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity", "affected_services"}).AddRow("inc_1", "investigating", "warning", `{"db"}`))
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$6").
+		WithArgs("investigating", base, "high", `{"db"}`, base, "inc_1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").
 		WithArgs("inc_1", "evt_3", "same_condition", 1, base).
@@ -223,7 +223,7 @@ func TestProcessNextEventRollsBackWhenOutboxInsertFails(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_4", "prometheus", "", "alert", base, "db", "prod", "high", "DB slow", "firing", []byte(`{}`)))
-	mock.ExpectQuery("(?s)SELECT id, status, severity FROM incidents.*FOR UPDATE").
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec("INSERT INTO incidents").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO incident_events").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -307,5 +307,241 @@ func TestInitialAffectedServices(t *testing.T) {
 	e4 := models.Event{Service: "", Labels: map[string]string{}}
 	if got := initialAffectedServices(e4); len(got) != 0 {
 		t.Fatalf("expected [], got %v", got)
+	}
+}
+
+func TestSeverityRankAndMaxSeverity(t *testing.T) {
+	cases := []struct {
+		current  string
+		incoming string
+		wantMax  string
+	}{
+		{"warning", "critical", "critical"},
+		{"critical", "warning", "critical"},
+		{"critical", "critical", "critical"},
+		{"low", "medium", "medium"},
+		{"info", "high", "high"},
+		{"medium", "warning", "medium"},
+		{"", "critical", "critical"},
+		{"high", "", "high"},
+		{"UNKNOWN", "warning", "warning"},
+		{"critical", "high", "critical"},
+	}
+
+	for _, tc := range cases {
+		got := maxSeverity(tc.current, tc.incoming)
+		if got != tc.wantMax {
+			t.Fatalf("maxSeverity(%q, %q) = %q, want %q", tc.current, tc.incoming, got, tc.wantMax)
+		}
+	}
+}
+
+func TestMergeAffectedServices(t *testing.T) {
+	// Deduplicates case-insensitively and preserves order
+	existing := []string{"docker_cadvisor", "mariadb"}
+	incoming := []string{"MARIADB", "redis", "  ", ""}
+	merged := mergeAffectedServices(existing, incoming)
+
+	expected := []string{"docker_cadvisor", "mariadb", "redis"}
+	if len(merged) != len(expected) {
+		t.Fatalf("expected len %d, got %d (%v)", len(expected), len(merged), merged)
+	}
+	for i, v := range expected {
+		if merged[i] != v {
+			t.Fatalf("at index %d expected %q, got %q", i, v, merged[i])
+		}
+	}
+
+	// Empty inputs
+	if got := mergeAffectedServices(nil, nil); len(got) != 0 {
+		t.Fatalf("expected empty slice, got %v", got)
+	}
+}
+
+func TestProcessNextEventSteadyStateScrapeThrottlesOutbox(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	labels := []byte(`{"grafana_fingerprint":"fp-steady"}`)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_steady", "grafana", "", "alert", base, "api", "prod", "critical", "API latency", "firing", labels))
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-steady").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity", "affected_services"}).AddRow("inc_steady", "investigating", "critical", `{"api"}`))
+	// Updates incident with same severity and merged services
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$6").
+		WithArgs("investigating", base, "critical", `{"api"}`, base, "inc_steady").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO incident_events").
+		WithArgs("inc_steady", "evt_steady", "same_condition", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_steady", 1, "extended_incident", "inc_steady", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Crucial: NO INSERT INTO investigation_outbox expectation, because severity did not escalate
+	mock.ExpectCommit()
+
+	c := &Correlator{db: db, now: func() time.Time { return base }}
+	processed, created, err := c.processNextEvent(context.Background())
+	if err != nil || !processed || created {
+		t.Fatalf("processed=%v created=%v err=%v", processed, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessNextEventSeverityEscalationTriggersOutbox(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	labels := []byte(`{"grafana_fingerprint":"fp-escalate"}`)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_esc", "grafana", "", "alert", base, "api", "prod", "critical", "API latency", "firing", labels))
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-escalate").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity", "affected_services"}).AddRow("inc_esc", "investigating", "warning", `{"api"}`))
+	// Updates incident with escalated severity (warning -> critical)
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$6").
+		WithArgs("investigating", base, "critical", `{"api"}`, base, "inc_esc").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO incident_events").
+		WithArgs("inc_esc", "evt_esc", "same_condition", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_esc", 1, "extended_incident", "inc_esc", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Outbox entry MUST be queued because severity escalated
+	requestKey := investigationRequestKey("inc_esc", "evt_esc")
+	mock.ExpectExec("INSERT INTO investigation_outbox").
+		WithArgs(outboxID(requestKey), "inc_esc", 1, requestKey, base, "incident_created", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	c := &Correlator{db: db, now: func() time.Time { return base }}
+	processed, created, err := c.processNextEvent(context.Background())
+	if err != nil || !processed || created {
+		t.Fatalf("processed=%v created=%v err=%v", processed, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessNextEventFlappingCooldownReopensResolvedIncident(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 10, 0, 0, time.UTC)
+	labels := []byte(`{"grafana_fingerprint":"fp-flap"}`)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_flap", "grafana", "", "alert", base, "cadvisor", "prod", "critical", "Target Down", "firing", labels))
+	// 1. Open incident query returns nothing
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*status IN \\('open', 'investigating'\\).*FOR UPDATE").
+		WithArgs("prod", "fp:fp-flap").
+		WillReturnError(sql.ErrNoRows)
+	// 2. Resolved incident query within 15m cooldown window finds the recently resolved incident
+	resolvedAt := base.Add(-5 * time.Minute)
+	cutoff := base.Add(-15 * time.Minute)
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*status = 'resolved'.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-flap", cutoff).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "severity", "affected_services"}).AddRow("inc_flap", "resolved", "critical", `{"cadvisor"}`))
+	// 3. Incident is re-opened: status -> 'open', resolved_at -> NULL
+	mock.ExpectExec("(?s)UPDATE incidents SET status = \\$1, last_event_at = GREATEST.*WHERE id = \\$6").
+		WithArgs("open", base, "critical", `{"cadvisor"}`, base, "inc_flap").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 4. Incident event recorded with reason 'flapping_reopened'
+	mock.ExpectExec("INSERT INTO incident_events").
+		WithArgs("inc_flap", "evt_flap", "flapping_reopened", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 5. Decision recorded as extended_incident
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_flap", 1, "extended_incident", "inc_flap", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 6. Outbox dispatched for renewed investigation of reopened flap
+	requestKey := investigationRequestKey("inc_flap", "evt_flap")
+	mock.ExpectExec("INSERT INTO investigation_outbox").
+		WithArgs(outboxID(requestKey), "inc_flap", 1, requestKey, base, "incident_created", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	c := &Correlator{
+		db:                     db,
+		now:                    func() time.Time { return base },
+		flappingCooldownWindow: 15 * time.Minute,
+	}
+	processed, created, err := c.processNextEvent(context.Background())
+	if err != nil || !processed || created {
+		t.Fatalf("processed=%v created=%v err=%v", processed, created, err)
+	}
+	_ = resolvedAt
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessNextEventFlappingCooldownExpiredCreatesNewIncident(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	base := time.Date(2026, 8, 19, 10, 30, 0, 0, time.UTC)
+	labels := []byte(`{"grafana_fingerprint":"fp-expired"}`)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT e.id.*FOR UPDATE SKIP LOCKED.*LIMIT 1").
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("evt_exp", "grafana", "", "alert", base, "cadvisor", "prod", "critical", "Target Down", "firing", labels))
+	// 1. Open incident query returns nothing
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*status IN \\('open', 'investigating'\\).*FOR UPDATE").
+		WithArgs("prod", "fp:fp-expired").
+		WillReturnError(sql.ErrNoRows)
+	// 2. Resolved incident query returns nothing (outside cooldown window)
+	cutoff := base.Add(-15 * time.Minute)
+	mock.ExpectQuery("(?s)SELECT id, status, severity, COALESCE.*FROM incidents.*status = 'resolved'.*FOR UPDATE").
+		WithArgs("prod", "fp:fp-expired", cutoff).
+		WillReturnError(sql.ErrNoRows)
+	// 3. New incident is created
+	mock.ExpectExec("INSERT INTO incidents").
+		WithArgs("inc_new", "Target Down", "fp:fp-expired", base, "critical", "prod", sqlmock.AnyArg(), correlationPolicy, correlationVersion, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO incident_events").
+		WithArgs("inc_new", "evt_exp", "new_incident", 1, base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO correlation_decisions").
+		WithArgs("evt_exp", 1, "new_incident", "inc_new", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	requestKey := investigationRequestKey("inc_new", "evt_exp")
+	mock.ExpectExec("INSERT INTO investigation_outbox").
+		WithArgs(outboxID(requestKey), "inc_new", 1, requestKey, base, "incident_created", base).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	c := &Correlator{
+		db:                     db,
+		now:                    func() time.Time { return base },
+		newIncidentID:          func(time.Time) string { return "inc_new" },
+		flappingCooldownWindow: 15 * time.Minute,
+	}
+	processed, created, err := c.processNextEvent(context.Background())
+	if err != nil || !processed || !created {
+		t.Fatalf("processed=%v created=%v err=%v", processed, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

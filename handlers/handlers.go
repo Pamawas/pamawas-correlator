@@ -41,6 +41,7 @@ func NewHandler(db *sql.DB, cfg config.Config, m *metrics.Metrics, investigatorU
 		CircuitBreakerThreshold: cfg.CircuitBreakerThreshold,
 		CircuitBreakerReset:     cfg.CircuitBreakerResetTimeout,
 		OutboxMaxAttempts:       cfg.OutboxMaxAttempts,
+		FlappingCooldownWindow:  cfg.FlappingCooldownWindow,
 	})
 
 	return &Handler{
