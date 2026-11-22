@@ -626,15 +626,23 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 }
 
 func initialAffectedServices(event models.Event) []string {
-	if event.Service != "" {
-		return []string{event.Service}
-	}
-	for _, key := range []string{"pod", "instance", "target", "container", "node"} {
-		if val, ok := event.Labels[key]; ok && val != "" {
-			return []string{val}
+	var res []string
+	for _, key := range []string{"pod", "instance", "target", "container", "node", "host"} {
+		if val, ok := event.Labels[key]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				res = append(res, trimmed)
+				break
+			}
 		}
 	}
-	return []string{}
+	if event.Service != "" {
+		trimmed := strings.TrimSpace(event.Service)
+		if trimmed != "" {
+			res = append(res, trimmed)
+		}
+	}
+	return mergeAffectedServices(nil, res)
 }
 
 func investigationRequestKey(incidentID, eventID string) string {

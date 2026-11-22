@@ -285,10 +285,10 @@ func eventColumns() []string {
 }
 
 func TestInitialAffectedServices(t *testing.T) {
-	// Explicit service wins
+	// Captures entity target and service
 	e1 := models.Event{Service: "my-svc", Labels: map[string]string{"pod": "my-pod"}}
-	if got := initialAffectedServices(e1); len(got) != 1 || got[0] != "my-svc" {
-		t.Fatalf("expected [my-svc], got %v", got)
+	if got := initialAffectedServices(e1); len(got) != 2 || got[0] != "my-pod" || got[1] != "my-svc" {
+		t.Fatalf("expected [my-pod my-svc], got %v", got)
 	}
 
 	// Falls back to pod label when service is empty
