@@ -81,6 +81,26 @@ func eventIdentity(event models.Event) string {
 	return "cond:" + strings.ToLower(strings.TrimSpace(event.Service)) + "|" + strings.ToLower(strings.TrimSpace(event.Title))
 }
 
+// incidentTitle returns the display title for a new incident.
+//
+// When a Grafana alert carries a `rulename` label that is non-empty and
+// differs from the alert title (case-insensitively), that label names the
+// specific alert rule and is appended after a middle-dot separator:
+//
+//	"DatasourceError · RAM"   – instead of the bare "DatasourceError"
+//
+// This makes it possible to distinguish incidents that share the same
+// alertname but were triggered by different rules (e.g. DatasourceError for
+// the "Reboot" rule versus the "RAM" rule).
+func incidentTitle(event models.Event) string {
+	base := strings.TrimSpace(event.Title)
+	rule := strings.TrimSpace(event.Labels["rulename"])
+	if rule == "" || strings.EqualFold(rule, base) {
+		return base
+	}
+	return base + " · " + rule
+}
+
 // severityRank orders severities monotonically so that incidents only escalate.
 func severityRank(s string) int {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -590,7 +610,7 @@ func (c *Correlator) applyIncidentMutation(ctx context.Context, tx *sql.Tx, even
 			INSERT INTO incidents
 				(id,title,identity_key,status,started_at,last_event_at,resolved_at,severity,environment,affected_services,correlation_policy,correlation_version,created_at,updated_at)
 			VALUES ($1,$2,$3,'open',$4,$4,NULL,$5,$6,$7,$8,$9,$10,$10)
-		`, incidentID, event.Title, identity, event.Timestamp, event.Severity, event.Environment, pq.Array(initialAffectedServices(event)), correlationPolicy, correlationVersion, now)
+		`, incidentID, incidentTitle(event), identity, event.Timestamp, event.Severity, event.Environment, pq.Array(initialAffectedServices(event)), correlationPolicy, correlationVersion, now)
 		if err != nil {
 			return "", "", false, false, err
 		}

@@ -545,3 +545,59 @@ func TestProcessNextEventFlappingCooldownExpiredCreatesNewIncident(t *testing.T)
 		t.Fatal(err)
 	}
 }
+
+// TestIncidentTitleAppendRulename covers the DatasourceError · RAM enrichment.
+func TestIncidentTitleAppendRulename(t *testing.T) {
+	cases := []struct {
+		name     string
+		title    string
+		labels   map[string]string
+		expected string
+	}{
+		{
+			name:     "rulename differs from title",
+			title:    "DatasourceError",
+			labels:   map[string]string{"rulename": "RAM"},
+			expected: "DatasourceError · RAM",
+		},
+		{
+			name:     "rulename same as title is not duplicated",
+			title:    "DatasourceError",
+			labels:   map[string]string{"rulename": "DatasourceError"},
+			expected: "DatasourceError",
+		},
+		{
+			name:     "rulename same as title case-insensitive is not duplicated",
+			title:    "DatasourceError",
+			labels:   map[string]string{"rulename": "datasourceerror"},
+			expected: "DatasourceError",
+		},
+		{
+			name:     "no rulename label leaves title unchanged",
+			title:    "DatasourceError",
+			labels:   map[string]string{},
+			expected: "DatasourceError",
+		},
+		{
+			name:     "empty rulename label leaves title unchanged",
+			title:    "DatasourceError",
+			labels:   map[string]string{"rulename": ""},
+			expected: "DatasourceError",
+		},
+		{
+			name:     "whitespace-only rulename label leaves title unchanged",
+			title:    "DatasourceError",
+			labels:   map[string]string{"rulename": "   "},
+			expected: "DatasourceError",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event := models.Event{Title: tc.title, Labels: tc.labels}
+			got := incidentTitle(event)
+			if got != tc.expected {
+				t.Errorf("incidentTitle() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
