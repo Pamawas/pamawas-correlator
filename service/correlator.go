@@ -536,7 +536,7 @@ func (c *Correlator) loadOpenIncidentByIdentity(ctx context.Context, tx *sql.Tx,
 			  AND status = 'resolved'
 			  AND resolved_at IS NOT NULL
 			  AND resolved_at >= $3
-			ORDER BY resolved_at DESC
+			ORDER BY resolved_at DESC, id DESC
 			LIMIT 1
 			FOR UPDATE
 		`, environment, identity, cutoff).Scan(&candidate.ID, &candidate.Status, &candidate.Severity, pq.Array(&candidate.AffectedServices))
@@ -790,7 +790,7 @@ func (c *Correlator) fetchAndLeaseOutboxItems(batchSize int) ([]outboxItem, erro
 			WHERE status = 'pending'
 			   OR (status = 'retryable' AND next_attempt_at <= now())
 			   OR (status = 'leased' AND lease_expires_at <= now())
-			ORDER BY created_at
+			ORDER BY created_at, id
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		`, batchSize)
